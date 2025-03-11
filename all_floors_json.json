@@ -1,0 +1,1406 @@
+{
+    "version": "5.4.6",
+    "flags": {},
+    "imagePath": "first_floor.png",
+    "imageData": null,
+    "imageHeight": 553,
+    "imageWidth": 269,
+    "shapes": {
+        "ground_floor": [
+            {
+                "label": "KITCHEN",
+                "points": [
+                    [
+                        33,
+                        33
+                    ],
+                    [
+                        33,
+                        186
+                    ],
+                    [
+                        82,
+                        186
+                    ],
+                    [
+                        81,
+                        231
+                    ],
+                    [
+                        101,
+                        236
+                    ],
+                    [
+                        84,
+                        240
+                    ],
+                    [
+                        81,
+                        260
+                    ],
+                    [
+                        82,
+                        287
+                    ],
+                    [
+                        33,
+                        289
+                    ],
+                    [
+                        33,
+                        522
+                    ],
+                    [
+                        237,
+                        521
+                    ],
+                    [
+                        237,
+                        413
+                    ],
+                    [
+                        218,
+                        412
+                    ],
+                    [
+                        217,
+                        397
+                    ],
+                    [
+                        231,
+                        391
+                    ],
+                    [
+                        234,
+                        376
+                    ],
+                    [
+                        218,
+                        371
+                    ],
+                    [
+                        216,
+                        355
+                    ],
+                    [
+                        236,
+                        353
+                    ],
+                    [
+                        237,
+                        243
+                    ],
+                    [
+                        141,
+                        243
+                    ],
+                    [
+                        131,
+                        146
+                    ],
+                    [
+                        237,
+                        145
+                    ],
+                    [
+                        237,
+                        34
+                    ],
+                    [
+                        132,
+                        34
+                    ]
+                ],
+                "group_id": 1,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "12'10\" x 7'3\"",
+                        "metric": "3.90m x 2.20m"
+                    },
+                    "is_multiple_room": true,
+                    "is_segment": true,
+                    "calculated_area": {
+                        "KITCHEN_1_area": {
+                            "metric": 7.2,
+                            "imperial": 78.06,
+                            "room_area": 83691.0,
+                            "Max_room_area": 99756,
+                            "Min_XY_point": [
+                                33,
+                                33
+                            ],
+                            "Max_XY_point": [
+                                237,
+                                522
+                            ],
+                            "room_scale_metric": 8.600986406832672e-05,
+                            "room_scale_imperial": 0.0009326924362110216
+                        },
+                        "BATHROOM_3_area": {
+                            "metric": 0.72,
+                            "imperial": 7.76,
+                            "room_area": 8323.5,
+                            "Max_room_area": 8415,
+                            "Min_XY_point": [
+                                138,
+                                151
+                            ],
+                            "Max_XY_point": [
+                                237,
+                                236
+                            ],
+                            "room_scale_metric": 8.600986406832672e-05,
+                            "room_scale_imperial": 0.0009326924362110216
+                        },
+                        "STAIRS_4_area": {
+                            "metric": 0.15,
+                            "imperial": 1.62,
+                            "room_area": 1741.0,
+                            "Max_room_area": 1886,
+                            "Min_XY_point": [
+                                31,
+                                192
+                            ],
+                            "Max_XY_point": [
+                                77,
+                                233
+                            ],
+                            "room_scale_metric": 8.600986406832672e-05,
+                            "room_scale_imperial": 0.0009326924362110216
+                        },
+                        "PORCH_5_area": {
+                            "metric": 0.23,
+                            "imperial": 2.53,
+                            "room_area": 2714.5,
+                            "Max_room_area": 2800,
+                            "Min_XY_point": [
+                                33,
+                                528
+                            ],
+                            "Max_XY_point": [
+                                103,
+                                568
+                            ],
+                            "room_scale_metric": 8.600986406832672e-05,
+                            "room_scale_imperial": 0.0009326924362110216
+                        }
+                    }
+                }
+            },
+            {
+                "label": "LIVING ROOM",
+                "points": null,
+                "group_id": 2,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "19'8\" x 13'1\"",
+                        "metric": "6.00m x 4.00m"
+                    },
+                    "is_multiple_room": true,
+                    "is_segment": false
+                }
+            },
+            {
+                "label": "BATHROOM",
+                "points": [
+                    [
+                        138,
+                        151
+                    ],
+                    [
+                        138,
+                        235
+                    ],
+                    [
+                        236,
+                        236
+                    ],
+                    [
+                        237,
+                        151
+                    ]
+                ],
+                "group_id": 3,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "Unknown",
+                        "metric": "Unknown"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {}
+                }
+            },
+            {
+                "label": "STAIRS",
+                "points": [
+                    [
+                        32,
+                        192
+                    ],
+                    [
+                        31,
+                        233
+                    ],
+                    [
+                        74,
+                        233
+                    ],
+                    [
+                        77,
+                        216
+                    ],
+                    [
+                        44,
+                        214
+                    ],
+                    [
+                        77,
+                        210
+                    ],
+                    [
+                        77,
+                        192
+                    ]
+                ],
+                "group_id": 4,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "Unknown",
+                        "metric": "Unknown"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {}
+                }
+            },
+            {
+                "label": "PORCH",
+                "points": [
+                    [
+                        34,
+                        528
+                    ],
+                    [
+                        33,
+                        568
+                    ],
+                    [
+                        103,
+                        568
+                    ],
+                    [
+                        103,
+                        529
+                    ],
+                    [
+                        41,
+                        529
+                    ]
+                ],
+                "group_id": 5,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "Unknown",
+                        "metric": "Unknown"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {}
+                }
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        75,
+                        25
+                    ],
+                    [
+                        75,
+                        55
+                    ],
+                    [
+                        117,
+                        55
+                    ],
+                    [
+                        116,
+                        24
+                    ]
+                ],
+                "group_id": "object_0",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        49,
+                        500
+                    ],
+                    [
+                        50,
+                        528
+                    ],
+                    [
+                        92,
+                        528
+                    ],
+                    [
+                        92,
+                        499
+                    ]
+                ],
+                "group_id": "object_1",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        79,
+                        232
+                    ],
+                    [
+                        108,
+                        232
+                    ],
+                    [
+                        108,
+                        196
+                    ],
+                    [
+                        78,
+                        196
+                    ]
+                ],
+                "group_id": "object_2",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        53,
+                        549
+                    ],
+                    [
+                        53,
+                        579
+                    ],
+                    [
+                        95,
+                        578
+                    ],
+                    [
+                        94,
+                        549
+                    ]
+                ],
+                "group_id": "object_3",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "stair",
+                "points": [
+                    [
+                        31,
+                        288
+                    ],
+                    [
+                        81,
+                        287
+                    ],
+                    [
+                        80,
+                        234
+                    ],
+                    [
+                        31,
+                        234
+                    ]
+                ],
+                "group_id": "object_0",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "bathtub",
+                "points": [
+                    [
+                        239,
+                        236
+                    ],
+                    [
+                        239,
+                        204
+                    ],
+                    [
+                        137,
+                        204
+                    ],
+                    [
+                        137,
+                        236
+                    ]
+                ],
+                "group_id": "object_0",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "sofa",
+                "points": [
+                    [
+                        135,
+                        242
+                    ],
+                    [
+                        135,
+                        281
+                    ],
+                    [
+                        233,
+                        281
+                    ],
+                    [
+                        233,
+                        242
+                    ]
+                ],
+                "group_id": "object_1",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "sofa",
+                "points": [
+                    [
+                        34,
+                        450
+                    ],
+                    [
+                        79,
+                        450
+                    ],
+                    [
+                        79,
+                        341
+                    ],
+                    [
+                        34,
+                        341
+                    ]
+                ],
+                "group_id": "object_2",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "sink",
+                "points": [
+                    [
+                        136,
+                        34
+                    ],
+                    [
+                        136,
+                        60
+                    ],
+                    [
+                        195,
+                        59
+                    ],
+                    [
+                        194,
+                        34
+                    ]
+                ],
+                "group_id": "object_3",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "stove",
+                "points": [
+                    [
+                        236,
+                        106
+                    ],
+                    [
+                        236,
+                        78
+                    ],
+                    [
+                        208,
+                        78
+                    ],
+                    [
+                        207,
+                        106
+                    ]
+                ],
+                "group_id": "object_4",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "vanity",
+                "points": [
+                    [
+                        236,
+                        199
+                    ],
+                    [
+                        236,
+                        174
+                    ],
+                    [
+                        211,
+                        174
+                    ],
+                    [
+                        210,
+                        199
+                    ]
+                ],
+                "group_id": "object_5",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "window",
+                "points": [
+                    [
+                        203,
+                        531
+                    ],
+                    [
+                        204,
+                        521
+                    ],
+                    [
+                        148,
+                        520
+                    ],
+                    [
+                        148,
+                        530
+                    ]
+                ],
+                "group_id": "object_6",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "window",
+                "points": [
+                    [
+                        152,
+                        24
+                    ],
+                    [
+                        152,
+                        34
+                    ],
+                    [
+                        207,
+                        34
+                    ],
+                    [
+                        207,
+                        24
+                    ]
+                ],
+                "group_id": "object_7",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "window",
+                "points": [
+                    [
+                        236,
+                        216
+                    ],
+                    [
+                        247,
+                        216
+                    ],
+                    [
+                        247,
+                        166
+                    ],
+                    [
+                        237,
+                        166
+                    ]
+                ],
+                "group_id": "object_8",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "toilet_bowl",
+                "points": [
+                    [
+                        237,
+                        172
+                    ],
+                    [
+                        237,
+                        152
+                    ],
+                    [
+                        206,
+                        152
+                    ],
+                    [
+                        206,
+                        171
+                    ]
+                ],
+                "group_id": "object_9",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "vanity",
+                "points": [
+                    [
+                        237,
+                        172
+                    ],
+                    [
+                        238,
+                        152
+                    ],
+                    [
+                        206,
+                        151
+                    ],
+                    [
+                        206,
+                        170
+                    ]
+                ],
+                "group_id": "object_10",
+                "shape_type": "polygon",
+                "flags": {}
+            }
+        ],
+        "first_floor": [
+            {
+                "label": "BEDROOM",
+                "points": [
+                    [
+                        33,
+                        31
+                    ],
+                    [
+                        33,
+                        234
+                    ],
+                    [
+                        236,
+                        234
+                    ],
+                    [
+                        236,
+                        31
+                    ]
+                ],
+                "group_id": 1,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "11'6\" x 10'2\"",
+                        "metric": "3.50m x 3.10m"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {
+                        "BEDROOM_1_area": {
+                            "metric": 10.85,
+                            "imperial": 116.92,
+                            "room_area": 41209.0,
+                            "Max_room_area": 41209,
+                            "Min_XY_point": [
+                                33,
+                                31
+                            ],
+                            "Max_XY_point": [
+                                236,
+                                234
+                            ],
+                            "room_scale_metric": 0.00026329199932053677,
+                            "room_scale_imperial": 0.002837163402816537
+                        },
+                        "Hallway_2_area": {
+                            "metric": 1.5,
+                            "imperial": 16.19,
+                            "room_area": 5706.0,
+                            "Max_room_area": 5838,
+                            "Min_XY_point": [
+                                88,
+                                238
+                            ],
+                            "Max_XY_point": [
+                                130,
+                                377
+                            ],
+                            "room_scale_metric": 0.00026329199932053677,
+                            "room_scale_imperial": 0.002837163402816537
+                        },
+                        "BEDROOM_3_area": {
+                            "metric": 3.54,
+                            "imperial": 38.15,
+                            "room_area": 13445.0,
+                            "Max_room_area": 13563,
+                            "Min_XY_point": [
+                                138,
+                                240
+                            ],
+                            "Max_XY_point": [
+                                237,
+                                377
+                            ],
+                            "room_scale_metric": 0.00026329199932053677,
+                            "room_scale_imperial": 0.002837163402816537
+                        },
+                        "Landing_4_area": {
+                            "metric": 0.89,
+                            "imperial": 9.57,
+                            "room_area": 3372.5,
+                            "Max_room_area": 3408,
+                            "Min_XY_point": [
+                                33,
+                                306
+                            ],
+                            "Max_XY_point": [
+                                81,
+                                377
+                            ],
+                            "room_scale_metric": 0.00026329199932053677,
+                            "room_scale_imperial": 0.002837163402816537
+                        },
+                        "BEDROOM_6_area": {
+                            "metric": 7.37,
+                            "imperial": 79.44,
+                            "room_area": 27998.5,
+                            "Max_room_area": 28356,
+                            "Min_XY_point": [
+                                32,
+                                381
+                            ],
+                            "Max_XY_point": [
+                                236,
+                                520
+                            ],
+                            "room_scale_metric": 0.00026329199932053677,
+                            "room_scale_imperial": 0.002837163402816537
+                        }
+                    }
+                }
+            },
+            {
+                "label": "Hallway",
+                "points": [
+                    [
+                        130,
+                        238
+                    ],
+                    [
+                        89,
+                        240
+                    ],
+                    [
+                        88,
+                        376
+                    ],
+                    [
+                        130,
+                        377
+                    ],
+                    [
+                        130,
+                        241
+                    ]
+                ],
+                "group_id": 2,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "Unknown",
+                        "metric": "Unknown"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {}
+                }
+            },
+            {
+                "label": "BEDROOM",
+                "points": [
+                    [
+                        138,
+                        240
+                    ],
+                    [
+                        138,
+                        377
+                    ],
+                    [
+                        236,
+                        377
+                    ],
+                    [
+                        237,
+                        240
+                    ],
+                    [
+                        145,
+                        241
+                    ]
+                ],
+                "group_id": 3,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "10'2\" x 5'3\"",
+                        "metric": "3.10m x 1.60m"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {
+                        "BEDROOM_1_area": {
+                            "metric": 15.07,
+                            "imperial": 162.17,
+                            "room_area": 41209.0,
+                            "Max_room_area": 41209,
+                            "Min_XY_point": [
+                                33,
+                                31
+                            ],
+                            "Max_XY_point": [
+                                236,
+                                234
+                            ],
+                            "room_scale_metric": 0.0003657008036570081,
+                            "room_scale_imperial": 0.003935338789353388
+                        },
+                        "Hallway_2_area": {
+                            "metric": 2.09,
+                            "imperial": 22.46,
+                            "room_area": 5706.0,
+                            "Max_room_area": 5838,
+                            "Min_XY_point": [
+                                88,
+                                238
+                            ],
+                            "Max_XY_point": [
+                                130,
+                                377
+                            ],
+                            "room_scale_metric": 0.0003657008036570081,
+                            "room_scale_imperial": 0.003935338789353388
+                        },
+                        "BEDROOM_3_area": {
+                            "metric": 4.92,
+                            "imperial": 52.91,
+                            "room_area": 13445.0,
+                            "Max_room_area": 13563,
+                            "Min_XY_point": [
+                                138,
+                                240
+                            ],
+                            "Max_XY_point": [
+                                237,
+                                377
+                            ],
+                            "room_scale_metric": 0.0003657008036570081,
+                            "room_scale_imperial": 0.003935338789353388
+                        },
+                        "Landing_4_area": {
+                            "metric": 1.23,
+                            "imperial": 13.27,
+                            "room_area": 3372.5,
+                            "Max_room_area": 3408,
+                            "Min_XY_point": [
+                                33,
+                                306
+                            ],
+                            "Max_XY_point": [
+                                81,
+                                377
+                            ],
+                            "room_scale_metric": 0.0003657008036570081,
+                            "room_scale_imperial": 0.003935338789353388
+                        },
+                        "BEDROOM_6_area": {
+                            "metric": 10.24,
+                            "imperial": 110.18,
+                            "room_area": 27998.5,
+                            "Max_room_area": 28356,
+                            "Min_XY_point": [
+                                32,
+                                381
+                            ],
+                            "Max_XY_point": [
+                                236,
+                                520
+                            ],
+                            "room_scale_metric": 0.0003657008036570081,
+                            "room_scale_imperial": 0.003935338789353388
+                        }
+                    }
+                }
+            },
+            {
+                "label": "Landing",
+                "points": [
+                    [
+                        33,
+                        306
+                    ],
+                    [
+                        33,
+                        377
+                    ],
+                    [
+                        81,
+                        377
+                    ],
+                    [
+                        80,
+                        306
+                    ]
+                ],
+                "group_id": 4,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "Unknown",
+                        "metric": "Unknown"
+                    },
+                    "is_multiple_room": true,
+                    "is_segment": true,
+                    "calculated_area": {}
+                }
+            },
+            {
+                "label": "Hallway",
+                "points": null,
+                "group_id": 5,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "Unknown",
+                        "metric": "Unknown"
+                    },
+                    "is_multiple_room": true,
+                    "is_segment": false
+                }
+            },
+            {
+                "label": "BEDROOM",
+                "points": [
+                    [
+                        33,
+                        381
+                    ],
+                    [
+                        32,
+                        519
+                    ],
+                    [
+                        236,
+                        520
+                    ],
+                    [
+                        236,
+                        382
+                    ],
+                    [
+                        66,
+                        382
+                    ]
+                ],
+                "group_id": 6,
+                "shape_type": "polygon",
+                "flags": {
+                    "dimensions": {
+                        "imperial": "12'2\" x 11'10\"",
+                        "metric": "3.70m x 3.60m"
+                    },
+                    "is_multiple_room": false,
+                    "is_segment": true,
+                    "calculated_area": {
+                        "BEDROOM_1_area": {
+                            "metric": 19.36,
+                            "imperial": 209.23,
+                            "room_area": 41209.0,
+                            "Max_room_area": 41209,
+                            "Min_XY_point": [
+                                33,
+                                31
+                            ],
+                            "Max_XY_point": [
+                                236,
+                                234
+                            ],
+                            "room_scale_metric": 0.00046974185357596276,
+                            "room_scale_imperial": 0.005077310700459241
+                        },
+                        "Hallway_2_area": {
+                            "metric": 2.68,
+                            "imperial": 28.97,
+                            "room_area": 5706.0,
+                            "Max_room_area": 5838,
+                            "Min_XY_point": [
+                                88,
+                                238
+                            ],
+                            "Max_XY_point": [
+                                130,
+                                377
+                            ],
+                            "room_scale_metric": 0.00046974185357596276,
+                            "room_scale_imperial": 0.005077310700459241
+                        },
+                        "BEDROOM_3_area": {
+                            "metric": 6.32,
+                            "imperial": 68.26,
+                            "room_area": 13445.0,
+                            "Max_room_area": 13563,
+                            "Min_XY_point": [
+                                138,
+                                240
+                            ],
+                            "Max_XY_point": [
+                                237,
+                                377
+                            ],
+                            "room_scale_metric": 0.00046974185357596276,
+                            "room_scale_imperial": 0.005077310700459241
+                        },
+                        "Landing_4_area": {
+                            "metric": 1.58,
+                            "imperial": 17.12,
+                            "room_area": 3372.5,
+                            "Max_room_area": 3408,
+                            "Min_XY_point": [
+                                33,
+                                306
+                            ],
+                            "Max_XY_point": [
+                                81,
+                                377
+                            ],
+                            "room_scale_metric": 0.00046974185357596276,
+                            "room_scale_imperial": 0.005077310700459241
+                        },
+                        "BEDROOM_6_area": {
+                            "metric": 13.15,
+                            "imperial": 142.16,
+                            "room_area": 27998.5,
+                            "Max_room_area": 28356,
+                            "Min_XY_point": [
+                                32,
+                                381
+                            ],
+                            "Max_XY_point": [
+                                236,
+                                520
+                            ],
+                            "room_scale_metric": 0.00046974185357596276,
+                            "room_scale_imperial": 0.005077310700459241
+                        }
+                    }
+                }
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        91,
+                        212
+                    ],
+                    [
+                        91,
+                        240
+                    ],
+                    [
+                        131,
+                        240
+                    ],
+                    [
+                        131,
+                        211
+                    ]
+                ],
+                "group_id": "object_0",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        132,
+                        368
+                    ],
+                    [
+                        162,
+                        368
+                    ],
+                    [
+                        162,
+                        330
+                    ],
+                    [
+                        132,
+                        330
+                    ]
+                ],
+                "group_id": "object_1",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "door",
+                "points": [
+                    [
+                        33,
+                        378
+                    ],
+                    [
+                        33,
+                        405
+                    ],
+                    [
+                        72,
+                        405
+                    ],
+                    [
+                        72,
+                        378
+                    ]
+                ],
+                "group_id": "object_2",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "stair",
+                "points": [
+                    [
+                        33,
+                        305
+                    ],
+                    [
+                        81,
+                        305
+                    ],
+                    [
+                        82,
+                        238
+                    ],
+                    [
+                        34,
+                        238
+                    ]
+                ],
+                "group_id": "object_0",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "bed",
+                "points": [
+                    [
+                        140,
+                        90
+                    ],
+                    [
+                        141,
+                        153
+                    ],
+                    [
+                        236,
+                        152
+                    ],
+                    [
+                        235,
+                        89
+                    ]
+                ],
+                "group_id": "object_0",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "bed",
+                "points": [
+                    [
+                        82,
+                        518
+                    ],
+                    [
+                        153,
+                        517
+                    ],
+                    [
+                        152,
+                        432
+                    ],
+                    [
+                        81,
+                        433
+                    ]
+                ],
+                "group_id": "object_1",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "bed",
+                "points": [
+                    [
+                        190,
+                        335
+                    ],
+                    [
+                        239,
+                        335
+                    ],
+                    [
+                        238,
+                        240
+                    ],
+                    [
+                        189,
+                        240
+                    ]
+                ],
+                "group_id": "object_2",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "window",
+                "points": [
+                    [
+                        60,
+                        23
+                    ],
+                    [
+                        60,
+                        33
+                    ],
+                    [
+                        115,
+                        33
+                    ],
+                    [
+                        115,
+                        23
+                    ]
+                ],
+                "group_id": "object_3",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "window",
+                "points": [
+                    [
+                        145,
+                        23
+                    ],
+                    [
+                        145,
+                        33
+                    ],
+                    [
+                        200,
+                        33
+                    ],
+                    [
+                        200,
+                        23
+                    ]
+                ],
+                "group_id": "object_4",
+                "shape_type": "polygon",
+                "flags": {}
+            },
+            {
+                "label": "window",
+                "points": [
+                    [
+                        104,
+                        520
+                    ],
+                    [
+                        104,
+                        529
+                    ],
+                    [
+                        159,
+                        529
+                    ],
+                    [
+                        159,
+                        520
+                    ]
+                ],
+                "group_id": "object_5",
+                "shape_type": "polygon",
+                "flags": {}
+            }
+        ]
+    },
+    "total_area": {
+        "Floors": {
+            "Ground Floor: 457 sq.ft. (42.5 sq.m.) approx.": {
+                "square_meter": "42.5",
+                "square_feet": "457"
+            },
+            "1st Floor: 448 sq.ft. (41.6 sq.m.) approx.": {
+                "square_meter": "41.6",
+                "square_feet": "448"
+            },
+            "Total Floor Area: 905 sq.ft. (84.1 sq.m.) approx.": {
+                "square_meter": "84.1",
+                "square_feet": "905"
+            }
+        }
+    },
+    "crop_box_info": {
+        "first_floor.png": [
+            445,
+            96,
+            229,
+            513,
+            20
+        ],
+        "ground_floor.png": [
+            17,
+            95,
+            231,
+            560,
+            22
+        ]
+    }
+}

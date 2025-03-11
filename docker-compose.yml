@@ -1,0 +1,52 @@
+services:
+  web:
+    container_name: analysis-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      sh -c "
+        python manage.py makemigrations &&
+        python manage.py migrate &&
+        daphne data_management_service.asgi:application -b 0.0.0.0 -p 8000
+      "
+    volumes:
+      - .:/code
+    ports:
+      - '8000:8000'
+    depends_on:
+      - redis
+    networks:
+      - default
+
+  redis:
+    container_name: analysis-app-redis
+    image: redis:latest
+    networks:
+      - default
+
+  celery:
+    container_name: analysis-app-celery
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      sh -c "
+        echo 'Waiting for analysis-app and redis...';
+        while ! nc -z analysis-app 8000 || ! nc -z redis 6379; do
+          sleep 1;
+        done;
+        echo 'Web and Redis are up - starting celery worker';
+        celery -A data_management_service worker --loglevel=info -Q analysis_queue
+      "
+    volumes:
+      - .:/code
+    depends_on:
+      - redis
+    networks:
+      - default
+    
+networks:
+  default:
+    name: shared_network
+    external: true
