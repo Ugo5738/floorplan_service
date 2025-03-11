@@ -1,13 +1,76 @@
 from django.db import models
 
-
-class Floorplan(models.Model):
-    # total_area_metric as fp display
-    pass
+# === API-Level Models ===
 
 
-class Floor(models.Model):
-    name = models.CharField(max_length=100, unique=True)
+class FloorPlanAnalysisResult(models.Model):
+    message = models.CharField(max_length=255)
+    user_id = models.CharField(max_length=255)
+    property_id = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.user_id} - {self.property_id}"
+
+
+class FloorPlan(models.Model):
+    analysis_result = models.ForeignKey(
+        FloorPlanAnalysisResult, related_name="floor_plans", on_delete=models.CASCADE
+    )
+    floorplan_id = models.CharField(max_length=255)
+    original_url = models.URLField()
+
+    def __str__(self):
+        return self.floorplan_id
+
+
+class AllFloorsData(models.Model):
+    floor_plan = models.OneToOneField(
+        FloorPlan, related_name="all_floors_data", on_delete=models.CASCADE
+    )
+    json_file_url = models.URLField()
+    csv_url = models.URLField()
+    total_area_csv_url = models.URLField()
+    image_labelme_side_by_side_url = models.URLField()
+    notes = models.TextField(blank=True, null=True)
+
+    def __str__(self):
+        return f"All Floors Data for {self.floor_plan.floorplan_id}"
+
+
+class PlanFloor(models.Model):
+    """
+    Represents each floor-level data inside the API response's 'floors' list.
+    """
+
+    floor_plan = models.ForeignKey(
+        FloorPlan, related_name="plan_floors", on_delete=models.CASCADE
+    )
+    floor = models.CharField(max_length=255)  # e.g., "first_floor" or "ground_floor"
+    label_me_url = models.URLField()
+    json_file_url = models.URLField()
+    image_url = models.URLField()
+    labelme_image_url = models.URLField()
+    csv_url = models.URLField()
+    image_side_by_side_url = models.URLField()
+
+    def __str__(self):
+        return f"{self.floor} - {self.floor_plan.floorplan_id}"
+
+
+# === CSV Data Models (Your Original Models, Renamed) ===
+
+
+class CsvFloor(models.Model):
+    """
+    Represents each row group from the CSV (identified by Floor_Name).
+    Related to a specific AllFloorsData (the CSV file downloaded from csv_url).
+    """
+
+    all_floors_data = models.ForeignKey(
+        AllFloorsData, related_name="csv_floors", on_delete=models.CASCADE
+    )
+    name = models.CharField(max_length=100)
     calculated_total_area_metric = models.FloatField(null=True, blank=True)
     calculated_total_area_imperial = models.FloatField(null=True, blank=True)
 
@@ -15,8 +78,12 @@ class Floor(models.Model):
         return self.name
 
 
-class Room(models.Model):
-    floor = models.ForeignKey(Floor, on_delete=models.CASCADE, related_name="rooms")
+class CsvRoom(models.Model):
+    """
+    Represents each room (row) in the CSV file.
+    """
+
+    floor = models.ForeignKey(CsvFloor, on_delete=models.CASCADE, related_name="rooms")
     room_name = models.CharField(max_length=100)
     is_segment = models.CharField(max_length=50, blank=True, null=True)
     room_id = models.FloatField(null=True, blank=True)
@@ -28,9 +95,13 @@ class Room(models.Model):
         return f"{self.room_name} ({self.floor.name})"
 
 
-class RoomPixelData(models.Model):
+class CsvRoomPixelData(models.Model):
+    """
+    Stores the pixel-specific data for each room from the CSV.
+    """
+
     room = models.OneToOneField(
-        Room, on_delete=models.CASCADE, related_name="pixel_data"
+        CsvRoom, on_delete=models.CASCADE, related_name="pixel_data"
     )
     min_x_pixels = models.FloatField(null=True, blank=True)
     min_y_pixels = models.FloatField(null=True, blank=True)
@@ -44,9 +115,13 @@ class RoomPixelData(models.Model):
         return f"Pixel Data for {self.room.room_name}"
 
 
-class RoomDimensions(models.Model):
+class CsvRoomDimensions(models.Model):
+    """
+    Stores dimension and area details for each room.
+    """
+
     room = models.OneToOneField(
-        Room, on_delete=models.CASCADE, related_name="dimensions"
+        CsvRoom, on_delete=models.CASCADE, related_name="dimensions"
     )
     dimensions_imperial = models.CharField(max_length=100, blank=True, null=True)
     dimensions_metric = models.CharField(max_length=100, blank=True, null=True)
@@ -59,9 +134,13 @@ class RoomDimensions(models.Model):
         return f"Dimensions for {self.room.room_name}"
 
 
-class RoomScalingFactors(models.Model):
+class CsvRoomScalingFactors(models.Model):
+    """
+    Stores scaling factors for metric and imperial measurements.
+    """
+
     room = models.OneToOneField(
-        Room, on_delete=models.CASCADE, related_name="scaling_factors"
+        CsvRoom, on_delete=models.CASCADE, related_name="scaling_factors"
     )
     scale_metric = models.FloatField(null=True, blank=True)
     scale_imperial = models.FloatField(null=True, blank=True)

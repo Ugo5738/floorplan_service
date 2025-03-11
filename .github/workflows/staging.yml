@@ -59,6 +59,7 @@ jobs:
           ORCHESTRATOR_APP_URL: ${{ secrets.ORCHESTRATOR_APP_URL }}
           SCRAPER_SERVICE_URL: ${{ secrets.SCRAPER_SERVICE_URL }}
           ANALYSIS_SERVICE_URL: ${{ secrets.ANALYSIS_SERVICE_URL }}
+          BACKUP_SERVICE_URL: ${{ secrets.BACKUP_SERVICE_URL }}
           FRONTEND_APP: ${{ secrets.FRONTEND_APP }}
           NOTIFICATION_SERVICE_URL: ${{ secrets.NOTIFICATION_SERVICE_URL }}
           # ===========================================================
