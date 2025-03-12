@@ -12,9 +12,8 @@ ADMIN_PASSWORD = config("ADMIN_PASSWORD")
 
 
 # ================================ DATABASES =======================================
-DATABASES = {
-    "default": dj_database_url.config(default="sqlite:///db.sqlite3", conn_max_age=600)
-}
+raw_db_url = config("DATABASE_URL", default="sqlite:///db.sqlite3")
+DATABASES = {"default": dj_database_url.parse(raw_db_url or "sqlite:///db.sqlite3")}
 
 # DATABASES = {
 #     "default": {

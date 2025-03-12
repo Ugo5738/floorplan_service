@@ -40,7 +40,7 @@ print(json.dumps(response.json(), indent=4))
 #                 "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/all_floors.csv",
 #                 "total_area_csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/total_area.csv",
 #                 "image_labelme_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/side_by_side_labelme.png",
-#                 "notes": ""
+#                 "notes": "",
 #             },
 #             "floors": [
 #                 {
@@ -50,7 +50,7 @@ print(json.dumps(response.json(), indent=4))
 #                     "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor.png",
 #                     "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor_labelmes.png",
 #                     "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor.csv",
-#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor_side_by_side_labelme.png"
+#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor_side_by_side_labelme.png",
 #                 },
 #                 {
 #                     "floor": "ground_floor",
@@ -59,9 +59,9 @@ print(json.dumps(response.json(), indent=4))
 #                     "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/ground_floor/ground_floor.png",
 #                     "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/ground_floor/ground_floor_labelmes.png",
 #                     "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/ground_floor/ground_floor.csv",
-#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/ground_floor/ground_floor_side_by_side_labelme.png"
-#                 }
-#             ]
+#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/ground_floor/ground_floor_side_by_side_labelme.png",
+#                 },
+#             ],
 #         }
-#     ]
+#     ],
 # }

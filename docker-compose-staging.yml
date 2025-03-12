@@ -7,7 +7,7 @@ services:
       sh -c "
         python manage.py makemigrations &&
         python manage.py migrate &&
-        daphne data_management_service.asgi:application -b 0.0.0.0 -p 8000
+        daphne floorplan_service.asgi:application -b 0.0.0.0 -p 8000
       "
     volumes:
       - .:/code
@@ -24,7 +24,7 @@ services:
   redis:
     image: redis:latest
     container_name: analysis-app-redis
-  
+
   nginx-proxy:
     image: jwilder/nginx-proxy
     container_name: nginx_reverse_proxy
@@ -66,7 +66,7 @@ services:
           sleep 1;
         done;
         echo 'Web and Redis are up - starting celery worker';
-        celery -A data_management_service worker --loglevel=info
+        celery -A floorplan_service worker --loglevel=info
       "
     volumes:
       - .:/code

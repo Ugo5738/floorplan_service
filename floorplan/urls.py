@@ -1,11 +1,11 @@
-from django.urls import include, path
-from rest_framework.routers import DefaultRouter
+from django.urls import path
 
 from floorplan import views
 
-router = DefaultRouter()
-# router.register(r"flooplans", views.FloorplanViewSet)
-
 urlpatterns = [
-    path("", include(router.urls)),
+    path(
+        "analyze-floorplans/",
+        views.FloorPlanAnalysisView.as_view(),
+        name="analyze_floorplans",
+    ),
 ]

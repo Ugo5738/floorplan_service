@@ -3,13 +3,13 @@ services:
     # build:
     #   context: .
     #   dockerfile: Dockerfile
-    image: data_management
+    image: floorplan_service
     command: >
       sh -c " 
         python manage.py makemigrations &&
         python manage.py migrate &&  
         python manage.py populate_db &&
-        daphne data_management_service.asgi:application -b 0.0.0.0 -p 8000
+        daphne floorplan_service.asgi:application -b 0.0.0.0 -p 8000
       "
     volumes:
       - .:/code
@@ -26,7 +26,7 @@ services:
   redis:
     image: redis:latest
     container_name: backup-analysis-app-redis
-  
+
   nginx-proxy:
     image: jwilder/nginx-proxy
     container_name: nginx_reverse_proxy
@@ -61,7 +61,7 @@ services:
     # build:
     #   context: .
     #   dockerfile: Dockerfile
-    image: data_management
+    image: floorplan_service
     command: >
       sh -c "
         echo 'Waiting for backup-analysis-app and redis...';
@@ -69,7 +69,7 @@ services:
           sleep 1;
         done;
         echo 'Web and Redis are up - starting celery worker';
-        celery -A data_management_service worker --loglevel=info;
+        celery -A floorplan_service worker --loglevel=info;
       "
     volumes:
       - .:/code

@@ -70,12 +70,12 @@ class CsvFloor(models.Model):
     all_floors_data = models.ForeignKey(
         AllFloorsData, related_name="csv_floors", on_delete=models.CASCADE
     )
-    name = models.CharField(max_length=100)
+    floor_name = models.CharField(max_length=100, null=True, blank=True)
     calculated_total_area_metric = models.FloatField(null=True, blank=True)
     calculated_total_area_imperial = models.FloatField(null=True, blank=True)
 
     def __str__(self):
-        return self.name
+        return self.floor_name
 
 
 class CsvRoom(models.Model):
@@ -84,8 +84,8 @@ class CsvRoom(models.Model):
     """
 
     floor = models.ForeignKey(CsvFloor, on_delete=models.CASCADE, related_name="rooms")
-    room_name = models.CharField(max_length=100)
-    is_segment = models.CharField(max_length=50, blank=True, null=True)
+    room_name = models.CharField(max_length=100, null=True, blank=True)
+    is_segment = models.CharField(max_length=50, null=True, blank=True)
     room_id = models.FloatField(null=True, blank=True)
     no_of_doors = models.FloatField(null=True, blank=True)
     no_of_windows = models.FloatField(null=True, blank=True)
@@ -103,13 +103,14 @@ class CsvRoomPixelData(models.Model):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="pixel_data"
     )
-    min_x_pixels = models.FloatField(null=True, blank=True)
-    min_y_pixels = models.FloatField(null=True, blank=True)
-    max_x_pixels = models.FloatField(null=True, blank=True)
-    max_y_pixels = models.FloatField(null=True, blank=True)
-    max_area_pixels = models.FloatField(null=True, blank=True)
-    actual_area_pixels = models.FloatField(null=True, blank=True)
-    pixel_ratio = models.FloatField(null=True, blank=True)
+    # Numeric fields from CSV for pixel positions and areas:
+    min_x_pixels = models.FloatField(null=True, blank=True)  # Min X Pixels
+    min_y_pixels = models.FloatField(null=True, blank=True)  # Min Y Pixels
+    max_x_pixels = models.FloatField(null=True, blank=True)  # Max X Pixels
+    max_y_pixels = models.FloatField(null=True, blank=True)  # Max Y Pixels
+    max_area_pixels = models.FloatField(null=True, blank=True)  # Max Area Pixels
+    actual_area_pixels = models.FloatField(null=True, blank=True)  # Actual Area Pixels
+    pixel_ratio = models.FloatField(null=True, blank=True)  # Pixel ratio
 
     def __str__(self):
         return f"Pixel Data for {self.room.room_name}"
@@ -123,12 +124,27 @@ class CsvRoomDimensions(models.Model):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="dimensions"
     )
-    dimensions_imperial = models.CharField(max_length=100, blank=True, null=True)
-    dimensions_metric = models.CharField(max_length=100, blank=True, null=True)
+    # Text fields for dimensions
+    dimensions_imperial = models.CharField(max_length=100, null=True, blank=True)
+    dimensions_metric = models.CharField(max_length=100, null=True, blank=True)
+
+    # Numeric fields for maximum areas
     max_area_metric = models.FloatField(null=True, blank=True)
     max_area_imperial = models.FloatField(null=True, blank=True)
-    calculated_area_metric = models.FloatField(null=True, blank=True)
-    calculated_area_imperial = models.FloatField(null=True, blank=True)
+
+    # Numeric fields for calculated areas:
+    calculated_sq_area_metric = models.FloatField(
+        null=True, blank=True
+    )  # Calculated Sq Area Metric
+    calculated_floor_total_sq_area_metric = models.FloatField(
+        null=True, blank=True
+    )  # Calculated Floor Total Sq Area Metric
+    calculated_area_imperial = models.FloatField(
+        null=True, blank=True
+    )  # calculated_area_imperial
+    calculated_floor_total_sq_area_imperial = models.FloatField(
+        null=True, blank=True
+    )  # Calculated Floor Total Sq Area Imperial
 
     def __str__(self):
         return f"Dimensions for {self.room.room_name}"
@@ -142,8 +158,8 @@ class CsvRoomScalingFactors(models.Model):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="scaling_factors"
     )
-    scale_metric = models.FloatField(null=True, blank=True)
-    scale_imperial = models.FloatField(null=True, blank=True)
+    scale_metric = models.FloatField(null=True, blank=True)  # Scale Metric
+    scale_imperial = models.FloatField(null=True, blank=True)  # Scale Imperial
 
     def __str__(self):
         return f"Scaling Factors for {self.room.room_name}"

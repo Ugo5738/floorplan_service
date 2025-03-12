@@ -21,7 +21,7 @@ drf-spectacular
 drf-yasg
 more-itertools
 openai==1.56.0
-opencv-python
+opencv-python==4.11.0.86
 openpyxl
 pandas
 Pillow
