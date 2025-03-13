@@ -122,6 +122,7 @@ jobs:
             # Ensure scripts are executable (in case they are not already)
             chmod +x install_docker.sh
             chmod +x entrypoint.sh
+            chmod +x deploy.sh
 
             # Check if Docker Compose is installed
             if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
