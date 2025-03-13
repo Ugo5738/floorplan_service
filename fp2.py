@@ -20,12 +20,17 @@ payload = {
 # Set the headers to indicate that we are sending JSON
 headers = {"Content-Type": "application/json"}
 
-# Send the POST request
-response = requests.post(url, json=payload, headers=headers)
-
-# Print the response from the API
-print(json.dumps(response.json(), indent=4))
-
+try:
+    # Set timeout to 300 seconds (5 minutes)
+    response = requests.post(url, json=payload, headers=headers, timeout=300)
+    response.raise_for_status()  # Check for HTTP errors
+    print(json.dumps(response.json(), indent=4))
+except requests.exceptions.Timeout:
+    print("The request timed out after 300 seconds.")
+except requests.exceptions.HTTPError as http_err:
+    print(f"HTTP error occurred: {http_err}")
+except requests.exceptions.RequestException as err:
+    print(f"An error occurred: {err}")
 
 # {
 #     "message": "Floor plans processed successfully",
