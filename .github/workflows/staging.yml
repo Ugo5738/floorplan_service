@@ -84,8 +84,9 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:staging-${{ github.sha }},${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:latest
-
+          tags: |
+            ${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:staging-${{ github.sha }}
+            ${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:latest
   deploy:
     needs: build-and-push-image
     runs-on: ubuntu-latest
@@ -108,19 +109,17 @@ jobs:
         run: rsync -avz -e "ssh -i ~/.ssh/id_rsa" ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP_STAGING }}:/home/ubuntu/floorplan/
       - name: Deploy to server
         uses: appleboy/ssh-action@master
-        env:
-          DOCKER_IMAGE: ${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:staging-${{ github.sha }}
         with:
           host: ${{ secrets.SERVER_IP_STAGING }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DOCKER_IMAGE
           script: |
             set -e
 
             echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
 
             cd /home/ubuntu/floorplan/
+            echo "DOCKER_IMAGE=$DOCKER_IMAGE" > .env
             docker pull $DOCKER_IMAGE
 
             # Ensure scripts are executable (in case they are not already)
@@ -136,8 +135,7 @@ jobs:
               echo "Docker Compose already installed."
             fi
 
-            docker compose -f docker-compose-prod.yml down
-            docker compose -f docker-compose-prod.yml up -d
+            ./deploy.sh
 
   cleanup:
     needs: deploy
