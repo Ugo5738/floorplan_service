@@ -36,7 +36,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Set execute permission for entrypoint.sh
 RUN chmod +x /code/entrypoint.sh
 
-# ENTRYPOINT ["/code/entrypoint.sh"]
+ENTRYPOINT ["/code/entrypoint.sh"]
 
 # Run the application
 CMD ["daphne", "floorplan_service.asgi:application", "--port", "$PORT", "--bind", "0.0.0.0"]
