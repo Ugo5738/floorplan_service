@@ -119,9 +119,6 @@ jobs:
             echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
 
             cd /home/ubuntu/floorplan/
-            echo "DOCKER_IMAGE=$DOCKER_IMAGE" > .env
-            docker pull $DOCKER_IMAGE
-
             # Ensure scripts are executable (in case they are not already)
             chmod +x install_docker.sh
             chmod +x entrypoint.sh
