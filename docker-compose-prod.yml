@@ -3,7 +3,9 @@ services:
     # build:
     #   context: .
     #   dockerfile: Dockerfile
-    image: floorplan_service
+    image: ${DOCKER_IMAGE}
+    container_name: floorplan-app
+    restart: always
     command: >
       sh -c " 
         python manage.py makemigrations &&
@@ -17,7 +19,6 @@ services:
       - "8000"
     depends_on:
       - redis
-    container_name: floorplan-app
     environment:
       - VIRTUAL_HOST=floorplan.supersami.com
       - LETSENCRYPT_HOST=floorplan.supersami.com
@@ -61,7 +62,9 @@ services:
     # build:
     #   context: .
     #   dockerfile: Dockerfile
-    image: floorplan_service
+    image: ${DOCKER_IMAGE}
+    container_name: floorplan-app-celery
+    restart: always
     command: >
       sh -c "
         echo 'Waiting for floorplan-app and redis...';
@@ -76,4 +79,3 @@ services:
     depends_on:
       - redis
       - web
-    container_name: floorplan-app-celery
