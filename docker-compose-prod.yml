@@ -17,15 +17,15 @@ services:
       - "8000"
     depends_on:
       - redis
-    container_name: backup-analysis-app
+    container_name: floorplan-app
     environment:
-      - VIRTUAL_HOST=data.supersami.com
-      - LETSENCRYPT_HOST=data.supersami.com
+      - VIRTUAL_HOST=floorplan.supersami.com
+      - LETSENCRYPT_HOST=floorplan.supersami.com
       - LETSENCRYPT_EMAIL=rolfgroenewold@gmail.com
 
   redis:
     image: redis:latest
-    container_name: backup-analysis-app-redis
+    container_name: floorplan-app-redis
 
   nginx-proxy:
     image: jwilder/nginx-proxy
@@ -40,7 +40,7 @@ services:
       - ./nginx/html:/usr/share/nginx/html
       # - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     environment:
-      - DEFAULT_HOST=data.supersami.com
+      - DEFAULT_HOST=floorplan.supersami.com
 
   letsencrypt-nginx-proxy-companion:
     image: jrcs/letsencrypt-nginx-proxy-companion
@@ -64,8 +64,8 @@ services:
     image: floorplan_service
     command: >
       sh -c "
-        echo 'Waiting for backup-analysis-app and redis...';
-        while ! nc -z backup-analysis-app 8000 || ! nc -z redis 6379; do
+        echo 'Waiting for floorplan-app and redis...';
+        while ! nc -z floorplan-app 8000 || ! nc -z redis 6379; do
           sleep 1;
         done;
         echo 'Web and Redis are up - starting celery worker';
@@ -76,4 +76,4 @@ services:
     depends_on:
       - redis
       - web
-    container_name: backup-analysis-app-celery
+    container_name: floorplan-app-celery

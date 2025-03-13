@@ -1,6 +1,6 @@
 services:
   web:
-    container_name: analysis-app
+    container_name: floorplan-app
     build:
       context: .
       dockerfile: Dockerfile
@@ -20,22 +20,22 @@ services:
       - redis
 
   redis:
-    container_name: analysis-app-redis
+    container_name: floorplan-app-redis
     image: redis:latest
 
   celery:
-    container_name: analysis-app-celery
+    container_name: floorplan-app-celery
     build:
       context: .
       dockerfile: Dockerfile
     command: >
       sh -c "
-        echo 'Waiting for analysis-app and redis...';
-        while ! nc -z analysis-app 8000 || ! nc -z redis 6379; do
+        echo 'Waiting for floorplan-app and redis...';
+        while ! nc -z floorplan-app 8000 || ! nc -z redis 6379; do
           sleep 1;
         done;
         echo 'Web and Redis are up - starting celery worker';
-        celery -A floorplan_service worker --loglevel=info -Q analysis_queue
+        celery -A floorplan_service worker --loglevel=info -Q floorplan_queue
       "
     volumes:
       - .:/code
