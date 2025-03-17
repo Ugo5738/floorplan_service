@@ -6,7 +6,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import (
+from floorplan.models import (
     AllFloorsData,
     CsvFloor,
     CsvRoom,
@@ -17,6 +17,7 @@ from .models import (
     FloorPlanAnalysisResult,
     PlanFloor,
 )
+from floorplan.utils.backup import backup_floorplan
 
 
 class FloorPlanAnalysisView(APIView):
@@ -39,13 +40,12 @@ class FloorPlanAnalysisView(APIView):
             "floorplans": floorplans,
         }
 
-        # Call the floorplan analyzer API (replace with actual URL)
-        analyzer_url = "http://165.232.101.36/fpextractor"  # Update with real endpoint
+        # Call the floorplan analyzer API
+        analyzer_url = "http://165.232.101.36/fpextractor"
         try:
             response = requests.post(analyzer_url, json=payload)
             response.raise_for_status()
             analysis_data = response.json()
-            print("this is the analysis_data: ", analysis_data)
         except requests.RequestException as e:
             return Response(
                 {"error": f"Failed to call floorplan analyzer API: {str(e)}"},
@@ -108,6 +108,12 @@ class FloorPlanAnalysisView(APIView):
                     {"warning": f"Failed to download CSV from {csv_url}: {str(e)}"},
                     status=status.HTTP_206_PARTIAL_CONTENT,
                 )
+
+            try:
+                backup_floorplan(floorplan)
+            except Exception as e:
+                # Log or handle error
+                print(f"Error backing up floorplan {floorplan.floorplan_id}: {e}")
 
         return Response(
             {"message": "Analysis completed", "analysis_id": analysis_result.id},
