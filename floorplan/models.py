@@ -92,7 +92,7 @@ class CsvRoom(models.Model):
     no_of_room_points = models.FloatField(null=True, blank=True)
 
     def __str__(self):
-        return f"{self.room_name} ({self.floor.name})"
+        return f"{self.room_name} ({self.floor.floor_name})"
 
 
 class CsvRoomPixelData(models.Model):
