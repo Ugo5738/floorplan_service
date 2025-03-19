@@ -35,7 +35,7 @@ services:
           sleep 1;
         done;
         echo 'Web and Redis are up - starting celery worker';
-        celery -A floorplan_service worker --loglevel=info -Q floorplan_queue
+        celery -A floorplan_service worker --loglevel=info;
       "
     volumes:
       - .:/code

@@ -1,6 +1,5 @@
 import requests
 from django.conf import settings
-from django.forms.models import model_to_dict
 
 
 def backup_floorplan(instance):

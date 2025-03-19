@@ -12,6 +12,9 @@ def should_exclude(file_path):
     # Exclude log files
     if file_path.lower().endswith(".log"):
         return True
+    # Exclude files in any directory named "staticfiles"
+    if "staticfiles" in file_path.split(os.sep):
+        return True
     # Add more exclusion rules here if necessary
     return False
 
