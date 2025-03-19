@@ -31,8 +31,8 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
         user_id,
         property_id,
     )
-
     payload = {
+        "webhook_url": "https://floorplan.supersami.com/api/floorplan/webhook/",
         "user_id": user_id,
         "property_id": property_id,
         "floorplans": floorplans,
@@ -42,19 +42,44 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
         logger.info("Calling analyzer API at %s", analyzer_url)
         response = requests.post(analyzer_url, json=payload)
         response.raise_for_status()
-        analysis_data = response.json()
-        logger.info("Analyzer API response received successfully")
+        # In the new workflow, the analyzer only confirms initiation.
+        logger.info("Analyzer API initiated analysis successfully")
     except requests.RequestException as e:
         logger.error("Failed to call analyzer API: %s", str(e))
         return {"error": f"Failed to call analyzer API: {str(e)}"}
 
+    # Optionally, you might record that the analysis has been initiated.
+    # Detailed processing is now deferred to the webhook callback.
+    logger.info(
+        "Floorplan analysis initiation recorded for user_id=%s, property_id=%s",
+        user_id,
+        property_id,
+    )
+    return {"message": "Analysis initiated"}
+
+
+@shared_task(bind=True)
+def process_floorplan_webhook(self, analysis_data):
+    """
+    Process the analysis payload received via the webhook.
+    The payload should contain:
+      - user_id
+      - property_id
+      - message (analysis result message)
+      - output_data: list with analysis details for each floorplan.
+    """
+    user_id = analysis_data.get("user_id")
+    property_id = analysis_data.get("property_id")
     message = analysis_data.get("message", "No message provided")
+    output_data = analysis_data.get("output_data", [])
+
     analysis_result = FloorPlanAnalysisResult.objects.create(
         message=message, user_id=user_id, property_id=property_id
     )
-    logger.info("Created FloorPlanAnalysisResult with id=%s", analysis_result.id)
+    logger.info(
+        "Created FloorPlanAnalysisResult with id=%s via webhook", analysis_result.id
+    )
 
-    output_data = analysis_data.get("output_data", [])
     for item in output_data:
         logger.info("Processing floorplan with id=%s", item["floorplan_id"])
         floorplan = FloorPlan.objects.create(
@@ -69,7 +94,7 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
             csv_url=all_floors["csv_url"],
             total_area_csv_url=all_floors["total_area_csv_url"],
             image_labelme_side_by_side_url=all_floors["image_labelme_side_by_side_url"],
-            notes=all_floors["notes"],
+            notes=all_floors.get("notes", ""),
         )
         logger.info("Created AllFloorsData for floorplan_id=%s", floorplan.floorplan_id)
 
@@ -112,14 +137,19 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
             )
 
     logger.info(
-        "Floorplan analysis task completed for analysis_result id=%s",
+        "Floorplan webhook processing completed for analysis_result id=%s",
         analysis_result.id,
     )
-    return {"message": "Analysis completed", "analysis_id": analysis_result.id}
+    return {
+        "message": "Webhook processing completed",
+        "analysis_id": analysis_result.id,
+    }
 
 
 def process_csv_data(reader, all_floors_data):
-    """Process CSV rows and store data in CSV-level models."""
+    """
+    Process CSV rows and store data in CSV-level models.
+    """
     floor_cache = {}
     for row in reader:
         floor_name = row.get("Floor_Name")

@@ -1,856 +1,926 @@
-# floorplan_service/tasks.py
+# floorplan/signals.py
+# from django.db.models.signals import post_save
+# from django.dispatch import receiver
+
+# from floorplan.models import FloorPlan
+# from floorplan.utils.backup import backup_floorplan
+
+
+# @receiver(post_save, sender=FloorPlan)
+# def backup_floorplan_handler(sender, instance, created, **kwargs):
+#     # Optionally, you can check for 'created' or even filter updates if needed.
+#     try:
+#         backup_floorplan(instance)
+#     except Exception as e:
+#         # Log error; you may want to implement retry logic or asynchronous backup here.
+#         print("Error backing up property:", e)
+
+
+# floorplan/tasks.py
+# floorplan/tasks.py
+import csv
+import io
+
+import requests
 from celery import shared_task
-
-
-@shared_task
-def my_task(param):
-    # Do something
-    print(param)
-
-
-# floorplan_service/asgi.py
-import os
-
-from decouple import config
-from django.core.asgi import get_asgi_application
-
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", config("DJANGO_SETTINGS_MODULE"))
-
-application = get_asgi_application()
-
-
-# floorplan_service/__init__.py
-from floorplan_service.celery import app as celery_app
-
-__all__ = ("celery_app",)
-
-
-# floorplan_service/celery.py
-import os
-
-from celery import Celery
-from decouple import config
 from django.conf import settings
 
-# set the default Django settings module for the 'celery' program.
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", config("DJANGO_SETTINGS_MODULE"))
-
-app = Celery("floorplan_service")
-
-# Using a string here means the worker doesn't have to serialize
-# the configuration object to child processes.
-app.config_from_object("django.conf:settings", namespace="CELERY")
-
-# # Set default queue
-# app.conf.task_default_queue = "floorplan_queue"
-
-# # Load task modules from all registered Django app configs.
-app.autodiscover_tasks(lambda: settings.INSTALLED_APPS)
-
-# app.autodiscover_tasks()
-app.conf.broker_url = settings.CELERY_BROKER_URL
-
-
-@app.task(bind=True)
-def debug_task(self):
-    print(f"Request: {self.request!r}")
-
-
-# floorplan_service/urls.py
-from accounts import views as account_views
-from django.conf import settings
-from django.conf.urls.static import static
-from django.contrib import admin
-from django.contrib.staticfiles.urls import staticfiles_urlpatterns
-from django.urls import include, path
-from drf_spectacular.views import (
-    SpectacularAPIView,
-    SpectacularRedocView,
-    SpectacularSwaggerView,
+from floorplan.models import (
+    AllFloorsData,
+    CsvFloor,
+    CsvRoom,
+    CsvRoomDimensions,
+    CsvRoomPixelData,
+    CsvRoomScalingFactors,
+    FloorPlan,
+    FloorPlanAnalysisResult,
+    PlanFloor,
 )
-from drf_yasg import openapi
-from drf_yasg.views import get_schema_view
-from rest_framework import permissions
-from rest_framework.routers import DefaultRouter
-
-router = DefaultRouter()
-
-schema_view = get_schema_view(
-    openapi.Info(
-        title="Analysis Floorplan Service API",
-        default_version="v1",
-        description="This is the documentation for Analysis Floorplan Service API",
-        terms_of_service="https://www.google.com/policies/terms/",
-        contact=openapi.Contact(email="contact@snippets.local"),
-        license=openapi.License(name="BSD License"),
-    ),
-    public=True,
-    permission_classes=[permissions.AllowAny],
-    authentication_classes=[],
-)
-
-default_urlpatterns = [
-    path("admin/", admin.site.urls),
-    path("dj-rest-auth/", include("dj_rest_auth.urls")),
-    path("dj-rest-auth/registration/", include("dj_rest_auth.registration.urls")),
-]
-
-permissions_urlpatterns = [
-    path("api/csrf-cookie/", account_views.GetCSRFToken.as_view()),
-]
-
-custom_urlpatterns = [
-    path("api/auth/", include("accounts.urls")),
-    path("api/floorplan/", include("floorplan.urls")),
-]
-
-spectacular_urlpatterns = [
-    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
-    # Optional UI:
-    path(
-        "api/schema/swagger-ui/",
-        SpectacularSwaggerView.as_view(url_name="schema"),
-        name="swagger-ui",
-    ),
-    path(
-        "api/schema/redoc/",
-        SpectacularRedocView.as_view(url_name="schema"),
-        name="redoc",
-    ),
-] + router.urls
-
-swagger_urlpatterns = [
-    path("swagger.json", schema_view.without_ui(cache_timeout=0), name="schema-json"),
-    path(
-        "swagger/",
-        schema_view.with_ui("swagger", cache_timeout=0),
-        name="schema-swagger-ui",
-    ),
-    path("redoc/", schema_view.with_ui("redoc", cache_timeout=0), name="schema-redoc"),
-]
-
-urlpatterns = (
-    default_urlpatterns
-    + custom_urlpatterns
-    + spectacular_urlpatterns
-    + swagger_urlpatterns
-    + permissions_urlpatterns
-)
-
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
-urlpatterns += staticfiles_urlpatterns()
-
-
-# floorplan_service/wsgi.py
-import os
-
-from decouple import config
-from django.core.wsgi import get_wsgi_application
-
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", config("DJANGO_SETTINGS_MODULE"))
-
-application = get_wsgi_application()
-
-
-# floorplan_service/settings/__init__.py
-
-
-# floorplan_service/settings/dev.py
-from .base import *
-
-DEBUG = True
-ALLOWED_HOSTS = ["*"]
-
-
-# ================================ SUPERUSER =======================================
-ADMIN_USERNAME = config("ADMIN_USERNAME")
-ADMIN_EMAIL = config("ADMIN_EMAIL")
-ADMIN_PASSWORD = config("ADMIN_PASSWORD")
-# ================================ SUPERUSER =======================================
-
-
-# ================================ DATABASES =======================================
-raw_db_url = config("DATABASE_URL", default="sqlite:///db.sqlite3")
-DATABASES = {"default": dj_database_url.parse(raw_db_url or "sqlite:///db.sqlite3")}
-
-# DATABASES = {
-#     "default": {
-#         "ENGINE": "django.db.backends.sqlite3",
-#         "NAME": BASE_DIR / "db.sqlite3",
-#     }
-# }
-# ================================ DATABASES =======================================
-
-
-# ================================ STORAGES =======================================
-# ==> STATIC FILE UPLOADS
-STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, "static"),
-]
-
-# ==> MEDIA FILE UPLOADS
-MEDIA_URL = "media/"
-MEDIA_ROOT = BASE_DIR / "media"
-# ================================ STORAGES =======================================
-
-
-# ================================ REDIS/CHANNELS =======================================
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": config("REDIS_URL"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
-
-# ==> CHANNELS
-default_channel_layer = {
-    "BACKEND": "channels_redis.core.RedisChannelLayer",
-    "CONFIG": {
-        "hosts": [config("REDIS_URL")],  # , 'redis://127.0.0.1:6379')],
-    },
-}
-CHANNEL_LAYERS = {"default": default_channel_layer}
-# ================================ REDIS =======================================
-
-
-# ================================ CELERY =======================================
-# Use the actual IP address and port of your Redis server
-CELERY_BROKER_URL = config("REDIS_URL")
-CELERY_RESULT_BACKEND = config("REDIS_URL")
-CELERY_TIMEZONE = "UTC"
-
-# List of modules to import when the Celery worker starts.
-CELERY_IMPORTS = ("floorplan_service.tasks",)
-
-# If using JSON as the serialization format
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-# ================================ CELERY =======================================
-
-
-# floorplan_service/settings/prod.py
-# import django_on_heroku
-
-from .base import *
-
-DEBUG = False
-ALLOWED_HOSTS = ["*"]
-
-
-# ================================ DATABASES =======================================
-DATABASES = {"default": dj_database_url.parse(config("DATABASE_URL"))}
-# DATABASES["default"]["OPTIONS"] = {"sslmode": "require"}
-# ================================ DATABASES =======================================
-
-
-# ================================ STORAGES =======================================
-# ==> AMAZON S3 SETTINGS
-AWS_ACCESS_KEY_ID = config("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = config("AWS_SECRET_ACCESS_KEY")
-AWS_STORAGE_BUCKET_NAME = config("AWS_STORAGE_BUCKET_NAME")
-AWS_S3_FILE_OVERWRITE = False
-AWS_DEFAULT_ACL = None
-AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
-AWS_S3_OBJECT_PARAMETERS = {"CacheControl": "max-age-86400"}
-AWS_LOCATION = "static"
-AWS_QUERYSTRING_AUTH = False
-AWS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-}
-
-# ==> MEDIA FILE UPLOADS
-PUBLIC_MEDIA_LOCATION = "media"
-MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{PUBLIC_MEDIA_LOCATION}/"
-# DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
-DEFAULT_FILE_STORAGE = f"{config('PROJECT_NAME')}.config.storage_backends.MediaStorage"
-
-# ==> STATIC FILE UPLOADS
-STATICFILES_STORAGE = "storages.backends.s3boto3.S3StaticStorage"
-STATIC_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{AWS_LOCATION}/"
-# ================================ STORAGES =======================================
-
-
-# ================================ REDIS/CHANNELS =======================================
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": config("REDIS_URL"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
-
-# ==> CHANNELS
-default_channel_layer = {
-    "BACKEND": "channels_redis.core.RedisChannelLayer",
-    "CONFIG": {
-        "hosts": [config("REDIS_URL")],  # , 'redis://127.0.0.1:6379')],
-    },
-}
-CHANNEL_LAYERS = {"default": default_channel_layer}
-# ================================ REDIS =======================================
-
-
-# ================================ CELERY =======================================
-# Use the actual IP address and port of your Redis server
-CELERY_BROKER_URL = config("REDIS_URL")
-CELERY_RESULT_BACKEND = config("REDIS_URL")
-CELERY_TIMEZONE = "UTC"
-
-# List of modules to import when the Celery worker starts.
-CELERY_IMPORTS = (f"{config('PROJECT_NAME')}.tasks",)
-
-# If using JSON as the serialization format
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-
-# CELERY_TASK_QUEUES = {
-#     "analysis_queue": {
-#         "exchange": "analysis_exchange",
-#         "routing_key": "analysis.#",
-#     },
-# }
-# ================================ CELERY =======================================
-
-# MY_DOMAIN = "http://analysis-app:8000"
-
-# ================================ HEROKU =======================================
-# # ==> HEROKU LOGGING
-# DEBUG_PROPAGATE_EXCEPTIONS = True
-# LOGGING = {
-#     "version": 1,
-#     "disable_existing_loggers": False,
-#     "formatters": {
-#         "verbose": {
-#             "format": "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s",
-#             "datefmt": "%d/%b/%Y %H:%M:%S",
-#         },
-#         "simple": {
-#             "format": "[%(asctime)s] %(levelname)s %(message)s",
-#         },
-#     },
-#     "handlers": {
-#         "console": {
-#             "level": "DEBUG",
-#             "class": "logging.StreamHandler"
-#         }
-#     },
-#     "loggers": {
-#         "dfxapp": {
-#             "handlers": ["console"],
-#             "level": "INFO",
-#         },
-#     },
-# }
-
-# # ==> HEROKU DATABASE
-# django_on_heroku.settings(locals(), staticfiles=False)
-# del DATABASES["default"]["OPTIONS"]["sslmode"]
-# ================================ HEROKU =======================================
-
-
-# ================================ SSL CONFIG =======================================
-# # Force SSL redirect if site is live
-# if os.getcwd() == '/app':ls
-
-#     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-#     SECURE_SSL_REDIRECT = True
-#     # DEBUG = False
-
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-USE_X_FORWARDED_HOST = True
-# ================================ SSL CONFIG =======================================
-
-
-# floorplan_service/settings/staging.py
-# import django_on_heroku
-
-from .base import *
-
-DEBUG = False
-ALLOWED_HOSTS = ["*"]
-
-
-# ================================ DATABASES =======================================
-DATABASES = {"default": dj_database_url.parse(config("DATABASE_URL"))}
-# DATABASES["default"]["OPTIONS"] = {"sslmode": "require"}
-# ================================ DATABASES =======================================
-
-
-# ================================ STORAGES =======================================
-# ==> AMAZON S3 SETTINGS
-AWS_ACCESS_KEY_ID = config("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = config("AWS_SECRET_ACCESS_KEY")
-AWS_STORAGE_BUCKET_NAME = config("AWS_STORAGE_BUCKET_NAME")
-AWS_S3_FILE_OVERWRITE = False
-AWS_DEFAULT_ACL = None
-AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
-AWS_S3_OBJECT_PARAMETERS = {"CacheControl": "max-age-86400"}
-AWS_LOCATION = "static"
-AWS_QUERYSTRING_AUTH = False
-AWS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-}
-
-# ==> MEDIA FILE UPLOADS
-PUBLIC_MEDIA_LOCATION = "media"
-MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{PUBLIC_MEDIA_LOCATION}/"
-# DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
-DEFAULT_FILE_STORAGE = "floorplan_service.config.storage_backends.MediaStorage"
-
-# ==> STATIC FILE UPLOADS
-STATICFILES_STORAGE = "storages.backends.s3boto3.S3StaticStorage"
-STATIC_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{AWS_LOCATION}/"
-# ================================ STORAGES =======================================
-
-# ================================ REDIS/CHANNELS =======================================
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": config("REDIS_URL"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
-
-# ==> CHANNELS
-default_channel_layer = {
-    "BACKEND": "channels_redis.core.RedisChannelLayer",
-    "CONFIG": {
-        "hosts": [config("REDIS_URL")],  # , 'redis://127.0.0.1:6379')],
-    },
-}
-CHANNEL_LAYERS = {"default": default_channel_layer}
-# ================================ REDIS =======================================
-
-
-# ================================ CELERY =======================================
-# Use the actual IP address and port of your Redis server
-CELERY_BROKER_URL = config("REDIS_URL")
-CELERY_RESULT_BACKEND = config("REDIS_URL")
-CELERY_TIMEZONE = "UTC"
-
-# List of modules to import when the Celery worker starts.
-CELERY_IMPORTS = ("floorplan_service.tasks",)
-
-# If using JSON as the serialization format
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-
-CELERY_TASK_QUEUES = {
-    "analysis_queue": {
-        "exchange": "analysis_exchange",
-        "routing_key": "analysis.#",
-    },
-}
-# ================================ CELERY =======================================
-
-MY_DOMAIN = "http://notification-service:8000"
-
-# ================================ HEROKU =======================================
-# # ==> HEROKU LOGGING
-# DEBUG_PROPAGATE_EXCEPTIONS = True
-# LOGGING = {
-#     "version": 1,
-#     "disable_existing_loggers": False,
-#     "formatters": {
-#         "verbose": {
-#             "format": "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s",
-#             "datefmt": "%d/%b/%Y %H:%M:%S",
-#         },
-#         "simple": {
-#             "format": "[%(asctime)s] %(levelname)s %(message)s",
-#         },
-#     },
-#     "handlers": {
-#         "console": {
-#             "level": "DEBUG",
-#             "class": "logging.StreamHandler"
-#         }
-#     },
-#     "loggers": {
-#         "dfxapp": {
-#             "handlers": ["console"],
-#             "level": "INFO",
-#         },
-#     },
-# }
-
-# # ==> HEROKU DATABASE
-# django_on_heroku.settings(locals(), staticfiles=False)
-# del DATABASES["default"]["OPTIONS"]["sslmode"]
-# ================================ HEROKU =======================================
-
-
-# ================================ SSL CONFIG =======================================
-# # Force SSL redirect if site is live
-# if os.getcwd() == '/app':ls
-
-#     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-#     SECURE_SSL_REDIRECT = True
-#     # DEBUG = False
-# ================================ SSL CONFIG =======================================
-
-
-# floorplan_service/settings/base.py
-import os
-import secrets
-from datetime import timedelta
-from pathlib import Path
-from typing import List
-
-import dj_database_url
-from corsheaders.defaults import default_headers
-from decouple import config
-
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-SECRET_KEY = config("SECRET_KEY")
-
-# Application definition
-DEFAULT_APPS = [
-    "django.contrib.admin",
-    "django.contrib.auth",
-    "django.contrib.contenttypes",
-    "django.contrib.sessions",
-    "django.contrib.messages",
-    "django.contrib.staticfiles",
-]
-
-THIRD_PARTY_APPS = [
-    "corsheaders",
-    "channels",
-    "django_countries",
-    "django_extensions",
-    "django_filters",
-    "django_rest_passwordreset",
-    "drf_yasg",
-    "drf_spectacular",
-    "storages",
-    "django.contrib.sites",
-    "rest_framework",
-    "rest_framework.authtoken",
-    "rest_framework_simplejwt",
-    "rest_framework_simplejwt.token_blacklist",
-    "allauth",
-    "allauth.account",
-    "allauth.socialaccount",
-    "allauth.socialaccount.providers.google",
-    # 'allauth.socialaccount.providers.facebook',
-    "dj_rest_auth",
-    "dj_rest_auth.registration",
-]
-
-LOCAL_APPS = ["accounts", "floorplan"]
-
-OTHER_APPS = [
-    # "debug_toolbar",
-]
-
-INSTALLED_APPS = DEFAULT_APPS + LOCAL_APPS + THIRD_PARTY_APPS + OTHER_APPS
-
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "corsheaders.middleware.CorsMiddleware",  # Custom added
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "allauth.account.middleware.AccountMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    # 'accounts.middleware.PaymentMiddleware',
-]
-
-ROOT_URLCONF = "floorplan_service.urls"
-
-TEMPLATES = [
-    {
-        "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [os.path.join(BASE_DIR, "templates")],
-        "APP_DIRS": True,
-        "OPTIONS": {
-            "context_processors": [
-                "django.template.context_processors.debug",
-                "django.template.context_processors.request",
-                "django.contrib.auth.context_processors.auth",
-                "django.contrib.messages.context_processors.messages",
-            ],
-        },
-    },
-]
-
-WSGI_APPLICATION = "floorplan_service.wsgi.application"
-
-
-# Password validation
-# https://docs.djangoproject.com/en/4.2/ref/settings/#auth-password-validators
-
-AUTH_PASSWORD_VALIDATORS = [
-    {
-        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
-    },
-    {
-        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
-    },
-    {
-        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
-    },
-    {
-        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
-    },
-]
-
-
-# Internationalization
-# https://docs.djangoproject.com/en/4.2/topics/i18n/
-
-LANGUAGE_CODE = "en-us"
-
-TIME_ZONE = "UTC"
-
-USE_I18N = True
-
-USE_TZ = True
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
-
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-
-# ================================ CUSTOM CONFIGS =======================================
-AUTH_USER_MODEL = "accounts.User"
-ASGI_APPLICATION = "floorplan_service.asgi.application"
-
-LOGIN_URL = "login"
-LOGOUT_URL = "logout"
-LOGIN_REDIRECT_URL = "index"  # "dashboard"
-LOGOUT_REDIRECT_URL = "login"
-
-
-def get_origin_list(env_variable: str, default: str = "") -> List[str]:
-    origins: str = config(env_variable, default)
-    return [origin.strip() for origin in origins.split(",") if origin.strip()]
-
-
-# ==> CORS
-CORS_ALLOW_ALL_ORIGINS = False
-CORS_ALLOWED_ORIGINS = get_origin_list("CORS_ORIGINS")
-CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_HEADERS = list(default_headers) + [
-    "x-csrftoken",
-]
-
-# ==> CSRF
-CSRF_TRUSTED_ORIGINS = get_origin_list("CSRF_TRUSTED_ORIGINS")
-CSRF_COOKIE_SAMESITE = "Lax"
-SESSION_COOKIE_SAMESITE = "Lax"
-CSRF_COOKIE_HTTPONLY = False  # False to allow JavaScript to access the cookie
-SESSION_COOKIE_HTTPONLY = True
-
-# ==> CONSTANTS
-CART_SESSION_ID = secrets.token_urlsafe(16)
-
-SITE_ID = 1
-
-# ==> AUTHENTICATION
-AUTHENTICATION_BACKENDS = [
-    "django.contrib.auth.backends.ModelBackend",
-    # "allauth.account.auth_backends.AuthenticationBackend",
-]
-
-# ==> DJ-REST-Auth settings
-REST_AUTH = {
-    "USE_JWT": True,
-    "JWT_AUTH_COOKIE": "my-app-auth",
-    "JWT_AUTH_REFRESH_COOKIE": "my-refresh-token",
-}
-
-# ==> REST FRAMEWORK
-REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.TokenAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
-    ],
-    # "DEFAULT_PERMISSION_CLASSES": [
-    #     "rest_framework.permissions.IsAuthenticated",
-    # ],
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
-    "PAGE_SIZE": 10,
-}
-
-SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=10),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
-    "ROTATE_REFRESH_TOKENS": False,
-    "BLACKLIST_AFTER_ROTATION": False,
-    "UPDATE_LAST_LOGIN": False,
-    "ALGORITHM": "HS256",
-    "SIGNING_KEY": SECRET_KEY,
-    "VERIFYING_KEY": "",
-    "AUDIENCE": None,
-    "ISSUER": None,
-    "JSON_ENCODER": None,
-    "JWK_URL": None,
-    "LEEWAY": 0,
-    "AUTH_HEADER_TYPES": ("Bearer",),
-    "AUTH_HEADER_NAME": "HTTP_AUTHORIZATION",
-    "USER_ID_FIELD": "id",
-    "USER_ID_CLAIM": "user_id",
-    "USER_AUTHENTICATION_RULE": "rest_framework_simplejwt.authentication.default_user_authentication_rule",
-    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
-    "TOKEN_TYPE_CLAIM": "token_type",
-    "TOKEN_USER_CLASS": "rest_framework_simplejwt.models.TokenUser",
-    "JTI_CLAIM": "jti",
-    "SLIDING_TOKEN_REFRESH_EXP_CLAIM": "refresh_exp",
-    "SLIDING_TOKEN_LIFETIME": timedelta(minutes=15),
-    "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=1),
-    "TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainPairSerializer",
-    "TOKEN_REFRESH_SERIALIZER": "rest_framework_simplejwt.serializers.TokenRefreshSerializer",
-    "TOKEN_VERIFY_SERIALIZER": "rest_framework_simplejwt.serializers.TokenVerifySerializer",
-    "TOKEN_BLACKLIST_SERIALIZER": "rest_framework_simplejwt.serializers.TokenBlacklistSerializer",
-    "SLIDING_TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainSlidingSerializer",
-    "SLIDING_TOKEN_REFRESH_SERIALIZER": "rest_framework_simplejwt.serializers.TokenRefreshSlidingSerializer",
-}
-
-SPECTACULAR_SETTINGS = {
-    "TITLE": "Notification Service API",
-    "DESCRIPTION": "Notification Service description",
-    "VERSION": "1.0.0",
-    "SERVE_INCLUDE_SCHEMA": True,
-}
-
-# ================================ CUSTOM VARIABLES =======================================
-# ==> SUPERUSER
-ADMIN_USERNAME = config("ADMIN_USERNAME")
-ADMIN_EMAIL = config("ADMIN_EMAIL")
-ADMIN_PHONE = config("ADMIN_PHONE")
-ADMIN_PASSWORD = config("ADMIN_PASSWORD")
-
-# ==> OPENAI
-OPENAI_API_KEY = config("OPENAI_API_KEY")
-ASSISTANT_ID = config("ASSISTANT_ID")
-MODEL_NAME = config("MODEL_NAME")
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-# ==> EXTERNAL SERVICES
-# SCRAPER APP
-SCRAPER_SERVICE_URL = config("SCRAPER_SERVICE_URL")
-
-# ORCHESTRATOR APP
-ORCHESTRATOR_APP_URL = config("ORCHESTRATOR_APP_URL")
-
-# BACKUP_DB_SERVICE
-BACKUP_SERVICE_URL = config("BACKUP_SERVICE_URL")
-# ================================ CUSTOM VARIABLES =======================================
-
-
-# floorplan_service/config/logging_config.py
-import logging
-import os
-
-# from celery.signals import after_setup_logger
-
-
-# @after_setup_logger.connect
-# def setup_loggers(logger, *args, **kwargs):
-#     logger.addHandler(logging.StreamHandler())
-#     logger.setLevel(logging.DEBUG)
-
-
-class CustomFormatter(logging.Formatter):
-    def __init__(self, fmt="%(levelname)s: %(message)s"):
-        super().__init__(fmt)
-
-    def format(self, record):
-        # Change format for ERROR level and above (ERROR, CRITICAL)
-        if record.levelno >= logging.ERROR:
-            self._style._fmt = "%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
+from floorplan.utils.backup import backup_floorplan
+from floorplan_service.config.logging_config import configure_logger
+
+# Configure a logger for this module
+logger = configure_logger(__name__)
+
+
+@shared_task(bind=True)
+def process_floorplan_analysis(self, user_id, property_id, floorplans):
+    logger.info(
+        "Starting floorplan analysis task for user_id=%s, property_id=%s",
+        user_id,
+        property_id,
+    )
+
+    payload = {
+        "user_id": user_id,
+        "property_id": property_id,
+        "floorplans": floorplans,
+    }
+    analyzer_url = "http://165.232.101.36/fpextractor"
+    try:
+        logger.info("Calling analyzer API at %s", analyzer_url)
+        response = requests.post(analyzer_url, json=payload)
+        response.raise_for_status()
+        analysis_data = response.json()
+        logger.info("Analyzer API response received successfully")
+    except requests.RequestException as e:
+        logger.error("Failed to call analyzer API: %s", str(e))
+        return {"error": f"Failed to call analyzer API: {str(e)}"}
+
+    message = analysis_data.get("message", "No message provided")
+    analysis_result = FloorPlanAnalysisResult.objects.create(
+        message=message, user_id=user_id, property_id=property_id
+    )
+    logger.info("Created FloorPlanAnalysisResult with id=%s", analysis_result.id)
+
+    output_data = analysis_data.get("output_data", [])
+    for item in output_data:
+        logger.info("Processing floorplan with id=%s", item["floorplan_id"])
+        floorplan = FloorPlan.objects.create(
+            analysis_result=analysis_result,
+            floorplan_id=item["floorplan_id"],
+            original_url=item["original_url"],
+        )
+        all_floors = item["all_floors"]
+        all_floors_data = AllFloorsData.objects.create(
+            floor_plan=floorplan,
+            json_file_url=all_floors["json_file_url"],
+            csv_url=all_floors["csv_url"],
+            total_area_csv_url=all_floors["total_area_csv_url"],
+            image_labelme_side_by_side_url=all_floors["image_labelme_side_by_side_url"],
+            notes=all_floors["notes"],
+        )
+        logger.info("Created AllFloorsData for floorplan_id=%s", floorplan.floorplan_id)
+
+        for floor_data in item["floors"]:
+            PlanFloor.objects.create(
+                floor_plan=floorplan,
+                floor=floor_data["floor"],
+                label_me_url=floor_data["label_me_url"],
+                json_file_url=floor_data["json_file_url"],
+                image_url=floor_data["image_url"],
+                labelme_image_url=floor_data["labelme_image_url"],
+                csv_url=floor_data["csv_url"],
+                image_side_by_side_url=floor_data["image_side_by_side_url"],
+            )
+            logger.info("Created PlanFloor for floor=%s", floor_data["floor"])
+
+        csv_url = all_floors["csv_url"]
+        try:
+            logger.info("Downloading CSV data from %s", csv_url)
+            csv_response = requests.get(csv_url)
+            csv_response.raise_for_status()
+            csv_content = csv_response.text
+            csv_file = io.StringIO(csv_content)
+            reader = csv.DictReader(csv_file)
+            process_csv_data(reader, all_floors_data)
+            logger.info(
+                "CSV data processed successfully for floorplan_id=%s",
+                floorplan.floorplan_id,
+            )
+        except requests.RequestException as e:
+            logger.error("Failed to download CSV from %s: %s", csv_url, str(e))
+
+        try:
+            logger.info("Backing up floorplan with id=%s", floorplan.floorplan_id)
+            backup_floorplan(floorplan)
+            logger.info("Backup completed for floorplan_id=%s", floorplan.floorplan_id)
+        except Exception as e:
+            logger.error(
+                "Error backing up floorplan %s: %s", floorplan.floorplan_id, str(e)
+            )
+
+    logger.info(
+        "Floorplan analysis task completed for analysis_result id=%s",
+        analysis_result.id,
+    )
+    return {"message": "Analysis completed", "analysis_id": analysis_result.id}
+
+
+def process_csv_data(reader, all_floors_data):
+    """Process CSV rows and store data in CSV-level models."""
+    floor_cache = {}
+    for row in reader:
+        floor_name = row.get("Floor_Name")
+        if not floor_name:
+            continue
+
+        if floor_name not in floor_cache:
+            floor, _ = CsvFloor.objects.get_or_create(
+                all_floors_data=all_floors_data,
+                floor_name=floor_name,
+                defaults={
+                    "calculated_total_area_metric": (
+                        float(row["Calculated Floor Total Sq Area Metric"])
+                        if row.get("Calculated Floor Total Sq Area Metric")
+                        else None
+                    ),
+                    "calculated_total_area_imperial": (
+                        float(row["Calculated Floor Total Sq Area Imperial"])
+                        if row.get("Calculated Floor Total Sq Area Imperial")
+                        else None
+                    ),
+                },
+            )
+            floor_cache[floor_name] = floor
         else:
-            self._style._fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        return super().format(record)
+            floor = floor_cache[floor_name]
+
+        room = CsvRoom(
+            floor=floor,
+            room_name=row.get("Room_Name"),
+            is_segment=row.get("is_segment") or None,
+            room_id=float(row["Room_id"]) if row.get("Room_id") else None,
+            no_of_doors=float(row["No_of_door"]) if row.get("No_of_door") else None,
+            no_of_windows=(
+                float(row["No_of_window"]) if row.get("No_of_window") else None
+            ),
+            no_of_room_points=(
+                float(row["No_of_room_points"])
+                if row.get("No_of_room_points")
+                else None
+            ),
+        )
+        room.save()
+
+        pixel_fields = [
+            "Min X Pixels",
+            "Min Y Pixels",
+            "Max X Pixels",
+            "Max Y Pixels",
+            "Max Area Pixels",
+            "Actual Area Pixels",
+            "Pixel ratio",
+        ]
+        if any(row.get(field) for field in pixel_fields):
+            CsvRoomPixelData.objects.create(
+                room=room,
+                min_x_pixels=(
+                    float(row["Min X Pixels"]) if row.get("Min X Pixels") else None
+                ),
+                min_y_pixels=(
+                    float(row["Min Y Pixels"]) if row.get("Min Y Pixels") else None
+                ),
+                max_x_pixels=(
+                    float(row["Max X Pixels"]) if row.get("Max X Pixels") else None
+                ),
+                max_y_pixels=(
+                    float(row["Max Y Pixels"]) if row.get("Max Y Pixels") else None
+                ),
+                max_area_pixels=(
+                    float(row["Max Area Pixels"])
+                    if row.get("Max Area Pixels")
+                    else None
+                ),
+                actual_area_pixels=(
+                    float(row["Actual Area Pixels"])
+                    if row.get("Actual Area Pixels")
+                    else None
+                ),
+                pixel_ratio=(
+                    float(row["Pixel ratio"]) if row.get("Pixel ratio") else None
+                ),
+            )
+
+        dimension_fields = [
+            "dimensions_imperial",
+            "dimensions_metric",
+            "Max Area Metric",
+            "Max Area Imperial",
+            "Calculated Sq Area Metric",
+            "calculated_area_imperial",
+        ]
+        if any(row.get(field) for field in dimension_fields):
+            CsvRoomDimensions.objects.create(
+                room=room,
+                dimensions_imperial=(
+                    row["dimensions_imperial"]
+                    if row.get("dimensions_imperial")
+                    and row["dimensions_imperial"] != "unknown"
+                    else None
+                ),
+                dimensions_metric=(
+                    row["dimensions_metric"]
+                    if row.get("dimensions_metric")
+                    and row["dimensions_metric"] != "unknown"
+                    else None
+                ),
+                max_area_metric=(
+                    float(row["Max Area Metric"])
+                    if row.get("Max Area Metric")
+                    else None
+                ),
+                max_area_imperial=(
+                    float(row["Max Area Imperial"])
+                    if row.get("Max Area Imperial")
+                    else None
+                ),
+                calculated_sq_area_metric=(
+                    float(row["Calculated Sq Area Metric"])
+                    if row.get("Calculated Sq Area Metric")
+                    else None
+                ),
+                calculated_area_imperial=(
+                    float(row["calculated_area_imperial"])
+                    if row.get("calculated_area_imperial")
+                    else None
+                ),
+            )
+
+        scaling_fields = ["Scale Metric", "Scale Imperial"]
+        if any(row.get(field) for field in scaling_fields):
+            CsvRoomScalingFactors.objects.create(
+                room=room,
+                scale_metric=(
+                    float(row["Scale Metric"]) if row.get("Scale Metric") else None
+                ),
+                scale_imperial=(
+                    float(row["Scale Imperial"]) if row.get("Scale Imperial") else None
+                ),
+            )
 
 
-def configure_logger(name):
-    # Create or get a logger
-    logger = logging.getLogger(name)
+# floorplan/models.py
+from django.db import models
 
-    # Set the log level
-    logger.setLevel(logging.DEBUG)  # Set to DEBUG to catch all levels
-
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(CustomFormatter())
-
-    # Create file handler for connection logs
-    file_handler = logging.FileHandler("connections.log")
-    file_handler.setFormatter(CustomFormatter())
-
-    # Add handlers to the logger
-    if not logger.handlers:  # Avoid adding multiple handlers if already present
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-
-    return logger
+# === API-Level Models ===
 
 
-def configure_file_logger(name):
-    # Create or get a logger
-    logger = logging.getLogger(name)
+class FloorPlanAnalysisResult(models.Model):
+    message = models.CharField(max_length=255)
+    user_id = models.CharField(max_length=255)
+    property_id = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
 
-    # Set the log level
-    logger.setLevel(logging.DEBUG)  # Set to DEBUG to catch all levels
-
-    # Create file handler for connection logs
-    log_file_path = "floorplan_service/connections.log"
-    file_handler = logging.FileHandler(log_file_path)
-    file_handler.setFormatter(CustomFormatter())
-
-    # Add handler to the logger
-    if not any(
-        isinstance(handler, logging.FileHandler) for handler in logger.handlers
-    ):  # Avoid adding multiple file handlers
-        logger.addHandler(file_handler)
-
-    return logger
+    def __str__(self):
+        return f"{self.user_id} - {self.property_id}"
 
 
-# floorplan_service/config/base_config.py
+class FloorPlan(models.Model):
+    analysis_result = models.ForeignKey(
+        FloorPlanAnalysisResult, related_name="floor_plans", on_delete=models.CASCADE
+    )
+    floorplan_id = models.CharField(max_length=255)
+    original_url = models.URLField()
+
+    def __str__(self):
+        return self.floorplan_id
+
+
+class AllFloorsData(models.Model):
+    floor_plan = models.OneToOneField(
+        FloorPlan, related_name="all_floors_data", on_delete=models.CASCADE
+    )
+    json_file_url = models.URLField()
+    csv_url = models.URLField()
+    total_area_csv_url = models.URLField()
+    image_labelme_side_by_side_url = models.URLField()
+    notes = models.TextField(blank=True, null=True)
+
+    def __str__(self):
+        return f"All Floors Data for {self.floor_plan.floorplan_id}"
+
+
+class PlanFloor(models.Model):
+    """
+    Represents each floor-level data inside the API response's 'floors' list.
+    """
+
+    floor_plan = models.ForeignKey(
+        FloorPlan, related_name="plan_floors", on_delete=models.CASCADE
+    )
+    floor = models.CharField(max_length=255)  # e.g., "first_floor" or "ground_floor"
+    label_me_url = models.URLField()
+    json_file_url = models.URLField()
+    image_url = models.URLField()
+    labelme_image_url = models.URLField()
+    csv_url = models.URLField()
+    image_side_by_side_url = models.URLField()
+
+    def __str__(self):
+        return f"{self.floor} - {self.floor_plan.floorplan_id}"
+
+
+# === CSV Data Models (Your Original Models, Renamed) ===
+
+
+class CsvFloor(models.Model):
+    """
+    Represents each row group from the CSV (identified by Floor_Name).
+    Related to a specific AllFloorsData (the CSV file downloaded from csv_url).
+    """
+
+    all_floors_data = models.ForeignKey(
+        AllFloorsData, related_name="csv_floors", on_delete=models.CASCADE
+    )
+    floor_name = models.CharField(max_length=100, null=True, blank=True)
+    calculated_total_area_metric = models.FloatField(null=True, blank=True)
+    calculated_total_area_imperial = models.FloatField(null=True, blank=True)
+
+    def __str__(self):
+        return self.floor_name
+
+
+class CsvRoom(models.Model):
+    """
+    Represents each room (row) in the CSV file.
+    """
+
+    floor = models.ForeignKey(CsvFloor, on_delete=models.CASCADE, related_name="rooms")
+    room_name = models.CharField(max_length=100, null=True, blank=True)
+    is_segment = models.CharField(max_length=50, null=True, blank=True)
+    room_id = models.FloatField(null=True, blank=True)
+    no_of_doors = models.FloatField(null=True, blank=True)
+    no_of_windows = models.FloatField(null=True, blank=True)
+    no_of_room_points = models.FloatField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.room_name} ({self.floor.floor_name})"
+
+
+class CsvRoomPixelData(models.Model):
+    """
+    Stores the pixel-specific data for each room from the CSV.
+    """
+
+    room = models.OneToOneField(
+        CsvRoom, on_delete=models.CASCADE, related_name="pixel_data"
+    )
+    # Numeric fields from CSV for pixel positions and areas:
+    min_x_pixels = models.FloatField(null=True, blank=True)  # Min X Pixels
+    min_y_pixels = models.FloatField(null=True, blank=True)  # Min Y Pixels
+    max_x_pixels = models.FloatField(null=True, blank=True)  # Max X Pixels
+    max_y_pixels = models.FloatField(null=True, blank=True)  # Max Y Pixels
+    max_area_pixels = models.FloatField(null=True, blank=True)  # Max Area Pixels
+    actual_area_pixels = models.FloatField(null=True, blank=True)  # Actual Area Pixels
+    pixel_ratio = models.FloatField(null=True, blank=True)  # Pixel ratio
+
+    def __str__(self):
+        return f"Pixel Data for {self.room.room_name}"
+
+
+class CsvRoomDimensions(models.Model):
+    """
+    Stores dimension and area details for each room.
+    """
+
+    room = models.OneToOneField(
+        CsvRoom, on_delete=models.CASCADE, related_name="dimensions"
+    )
+    # Text fields for dimensions
+    dimensions_imperial = models.CharField(max_length=100, null=True, blank=True)
+    dimensions_metric = models.CharField(max_length=100, null=True, blank=True)
+
+    # Numeric fields for maximum areas
+    max_area_metric = models.FloatField(null=True, blank=True)
+    max_area_imperial = models.FloatField(null=True, blank=True)
+
+    # Numeric fields for calculated areas:
+    calculated_sq_area_metric = models.FloatField(
+        null=True, blank=True
+    )  # Calculated Sq Area Metric
+    calculated_floor_total_sq_area_metric = models.FloatField(
+        null=True, blank=True
+    )  # Calculated Floor Total Sq Area Metric
+    calculated_area_imperial = models.FloatField(
+        null=True, blank=True
+    )  # calculated_area_imperial
+    calculated_floor_total_sq_area_imperial = models.FloatField(
+        null=True, blank=True
+    )  # Calculated Floor Total Sq Area Imperial
+
+    def __str__(self):
+        return f"Dimensions for {self.room.room_name}"
+
+
+class CsvRoomScalingFactors(models.Model):
+    """
+    Stores scaling factors for metric and imperial measurements.
+    """
+
+    room = models.OneToOneField(
+        CsvRoom, on_delete=models.CASCADE, related_name="scaling_factors"
+    )
+    scale_metric = models.FloatField(null=True, blank=True)  # Scale Metric
+    scale_imperial = models.FloatField(null=True, blank=True)  # Scale Imperial
+
+    def __str__(self):
+        return f"Scaling Factors for {self.room.room_name}"
+
+
+# floorplan/__init__.py
+
+
+# floorplan/apps.py
+from django.apps import AppConfig
+
+
+class FloorplanConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "floorplan"
+
+    def ready(self):
+        # Import the signals module to ensure signal handlers are registered.
+        import floorplan.signals  # registers the signal handlers
+
+        print("Floorplan signals have been imported and registered.")
+
+
+# floorplan/admin.py
+from django.contrib import admin
+
+from floorplan.models import (
+    AllFloorsData,
+    CsvFloor,
+    CsvRoom,
+    CsvRoomDimensions,
+    CsvRoomPixelData,
+    CsvRoomScalingFactors,
+    FloorPlan,
+    FloorPlanAnalysisResult,
+    PlanFloor,
+)
+
+
+class FloorPlanInline(admin.TabularInline):
+    model = FloorPlan
+    extra = 0
+
+
+@admin.register(FloorPlanAnalysisResult)
+class FloorPlanAnalysisResultAdmin(admin.ModelAdmin):
+    list_display = ("user_id", "property_id", "message", "created_at")
+    list_filter = ("created_at",)
+    search_fields = ("user_id", "property_id", "message")
+    date_hierarchy = "created_at"
+    inlines = [FloorPlanInline]
+
+
+class PlanFloorInline(admin.TabularInline):
+    model = PlanFloor
+    extra = 0
+
+
+class AllFloorsDataInline(admin.StackedInline):
+    model = AllFloorsData
+    extra = 0
+
+
+@admin.register(FloorPlan)
+class FloorPlanAdmin(admin.ModelAdmin):
+    list_display = ("floorplan_id", "get_property_id", "get_user_id")
+    search_fields = (
+        "floorplan_id",
+        "analysis_result__property_id",
+        "analysis_result__user_id",
+    )
+    inlines = [AllFloorsDataInline, PlanFloorInline]
+
+    def get_property_id(self, obj):
+        return obj.analysis_result.property_id
+
+    get_property_id.short_description = "Property ID"
+    get_property_id.admin_order_field = "analysis_result__property_id"
+
+    def get_user_id(self, obj):
+        return obj.analysis_result.user_id
+
+    get_user_id.short_description = "User ID"
+    get_user_id.admin_order_field = "analysis_result__user_id"
+
+
+@admin.register(AllFloorsData)
+class AllFloorsDataAdmin(admin.ModelAdmin):
+    list_display = ("get_floorplan_id", "get_property_id", "has_notes")
+    search_fields = (
+        "floor_plan__floorplan_id",
+        "floor_plan__analysis_result__property_id",
+        "floor_plan__analysis_result__user_id",
+    )
+    list_filter = ("floor_plan__analysis_result__created_at",)
+
+    def get_floorplan_id(self, obj):
+        return obj.floor_plan.floorplan_id
+
+    get_floorplan_id.short_description = "Floor Plan ID"
+    get_floorplan_id.admin_order_field = "floor_plan__floorplan_id"
+
+    def get_property_id(self, obj):
+        return obj.floor_plan.analysis_result.property_id
+
+    get_property_id.short_description = "Property ID"
+    get_property_id.admin_order_field = "floor_plan__analysis_result__property_id"
+
+    def has_notes(self, obj):
+        return bool(obj.notes)
+
+    has_notes.boolean = True
+    has_notes.short_description = "Has Notes"
+
+
+@admin.register(PlanFloor)
+class PlanFloorAdmin(admin.ModelAdmin):
+    list_display = ("floor", "get_floorplan_id", "get_property_id")
+    list_filter = ("floor",)
+    search_fields = (
+        "floor",
+        "floor_plan__floorplan_id",
+        "floor_plan__analysis_result__property_id",
+    )
+
+    def get_floorplan_id(self, obj):
+        return obj.floor_plan.floorplan_id
+
+    get_floorplan_id.short_description = "Floor Plan ID"
+    get_floorplan_id.admin_order_field = "floor_plan__floorplan_id"
+
+    def get_property_id(self, obj):
+        return obj.floor_plan.analysis_result.property_id
+
+    get_property_id.short_description = "Property ID"
+    get_property_id.admin_order_field = "floor_plan__analysis_result__property_id"
+
+
+class CsvRoomInline(admin.TabularInline):
+    model = CsvRoom
+    extra = 0
+    fields = ("room_name", "is_segment", "room_id", "no_of_doors", "no_of_windows")
+
+
+@admin.register(CsvFloor)
+class CsvFloorAdmin(admin.ModelAdmin):
+    list_display = (
+        "floor_name",
+        "get_floorplan_id",
+        "get_property_id",
+        "calculated_total_area_metric",
+        "calculated_total_area_imperial",
+        "room_count",
+    )
+    search_fields = (
+        "floor_name",
+        "all_floors_data__floor_plan__floorplan_id",
+        "all_floors_data__floor_plan__analysis_result__property_id",
+    )
+    inlines = [CsvRoomInline]
+
+    def get_floorplan_id(self, obj):
+        return obj.all_floors_data.floor_plan.floorplan_id
+
+    get_floorplan_id.short_description = "Floor Plan ID"
+    get_floorplan_id.admin_order_field = "all_floors_data__floor_plan__floorplan_id"
+
+    def get_property_id(self, obj):
+        return obj.all_floors_data.floor_plan.analysis_result.property_id
+
+    get_property_id.short_description = "Property ID"
+    get_property_id.admin_order_field = (
+        "all_floors_data__floor_plan__analysis_result__property_id"
+    )
+
+    def room_count(self, obj):
+        return obj.rooms.count()
+
+    room_count.short_description = "Room Count"
+
+
+class CsvRoomPixelDataInline(admin.StackedInline):
+    model = CsvRoomPixelData
+    extra = 0
+
+
+class CsvRoomDimensionsInline(admin.StackedInline):
+    model = CsvRoomDimensions
+    extra = 0
+
+
+class CsvRoomScalingFactorsInline(admin.StackedInline):
+    model = CsvRoomScalingFactors
+    extra = 0
+
+
+@admin.register(CsvRoom)
+class CsvRoomAdmin(admin.ModelAdmin):
+    list_display = (
+        "room_name",
+        "get_floor_name",
+        "get_floorplan_id",
+        "is_segment",
+        "no_of_doors",
+        "no_of_windows",
+    )
+    list_filter = ("is_segment", "floor__floor_name")
+    search_fields = (
+        "room_name",
+        "floor__floor_name",
+        "floor__all_floors_data__floor_plan__floorplan_id",
+    )
+    inlines = [
+        CsvRoomPixelDataInline,
+        CsvRoomDimensionsInline,
+        CsvRoomScalingFactorsInline,
+    ]
+
+    def get_floor_name(self, obj):
+        return obj.floor.floor_name
+
+    get_floor_name.short_description = "Floor"
+    get_floor_name.admin_order_field = "floor__floor_name"
+
+    def get_floorplan_id(self, obj):
+        return obj.floor.all_floors_data.floor_plan.floorplan_id
+
+    get_floorplan_id.short_description = "Floor Plan ID"
+    get_floorplan_id.admin_order_field = (
+        "floor__all_floors_data__floor_plan__floorplan_id"
+    )
+
+
+# Register the remaining models (if needed to access them independently)
+@admin.register(CsvRoomPixelData)
+class CsvRoomPixelDataAdmin(admin.ModelAdmin):
+    list_display = (
+        "get_room_name",
+        "get_floor_name",
+        "min_x_pixels",
+        "min_y_pixels",
+        "max_x_pixels",
+        "max_y_pixels",
+        "actual_area_pixels",
+    )
+    search_fields = ("room__room_name", "room__floor__floor_name")
+
+    def get_room_name(self, obj):
+        return obj.room.room_name
+
+    get_room_name.short_description = "Room"
+    get_room_name.admin_order_field = "room__room_name"
+
+    def get_floor_name(self, obj):
+        return obj.room.floor.floor_name
+
+    get_floor_name.short_description = "Floor"
+    get_floor_name.admin_order_field = "room__floor__floor_name"
+
+
+@admin.register(CsvRoomDimensions)
+class CsvRoomDimensionsAdmin(admin.ModelAdmin):
+    list_display = (
+        "get_room_name",
+        "get_floor_name",
+        "dimensions_metric",
+        "dimensions_imperial",
+        "calculated_sq_area_metric",
+        "calculated_area_imperial",
+    )
+    search_fields = ("room__room_name", "room__floor__floor_name")
+
+    def get_room_name(self, obj):
+        return obj.room.room_name
+
+    get_room_name.short_description = "Room"
+    get_room_name.admin_order_field = "room__room_name"
+
+    def get_floor_name(self, obj):
+        return obj.room.floor.floor_name
+
+    get_floor_name.short_description = "Floor"
+    get_floor_name.admin_order_field = "room__floor__floor_name"
+
+
+@admin.register(CsvRoomScalingFactors)
+class CsvRoomScalingFactorsAdmin(admin.ModelAdmin):
+    list_display = (
+        "get_room_name",
+        "get_floor_name",
+        "scale_metric",
+        "scale_imperial",
+    )
+    search_fields = ("room__room_name", "room__floor__floor_name")
+
+    def get_room_name(self, obj):
+        return obj.room.room_name
+
+    get_room_name.short_description = "Room"
+    get_room_name.admin_order_field = "room__room_name"
+
+    def get_floor_name(self, obj):
+        return obj.room.floor.floor_name
+
+    get_floor_name.short_description = "Floor"
+    get_floor_name.admin_order_field = "room__floor__floor_name"
+
+
+# floorplan/tests.py
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# floorplan/urls.py
+from django.urls import path
+
+from floorplan import views
+
+urlpatterns = [
+    path(
+        "analyze-floorplans/",
+        views.FloorPlanAnalysisView.as_view(),
+        name="analyze_floorplans",
+    ),
+]
+
+
+# floorplan/views.py
+import csv
+import io
+
+import requests
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from floorplan.tasks import process_floorplan_analysis
+
+
+class FloorPlanAnalysisView(APIView):
+    def post(self, request):
+        # Extract input data
+        user_id = request.data.get("user_id")
+        property_id = request.data.get("property_id")
+        floorplans = request.data.get("floorplans")
+
+        # Validate input
+        if not all([user_id, property_id, floorplans]):
+            return Response(
+                {"error": "Missing required fields: user_id, property_id, floorplans"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Enqueue the background task
+        process_floorplan_analysis.delay(user_id, property_id, floorplans)
+
+        # Return immediately with an accepted status
+        return Response(
+            {"message": "Floorplan analysis started."},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+# floorplan/utils/backup.py
+import requests
 from django.conf import settings
-from openai import OpenAI
-
-openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
-# floorplan_service/config/__init__.py
+def backup_floorplan(instance):
+    # Build the analysis result payload (exclude auto fields)
+    analysis_result_payload = {
+        "message": instance.analysis_result.message,
+        "user_id": instance.analysis_result.user_id,
+        "property_id": instance.analysis_result.property_id,
+    }
 
+    # Build the main floorplan payload – only required fields.
+    payload = {
+        "analysis_result": analysis_result_payload,
+        "floorplan_id": instance.floorplan_id,
+        "original_url": instance.original_url,
+    }
 
-# floorplan_service/config/storage_backends.py
-from storages.backends.s3boto3 import S3Boto3Storage
+    # Build the AllFloorsData payload if available.
+    if hasattr(instance, "all_floors_data"):
+        all_floors = instance.all_floors_data
+        all_floors_payload = {
+            "json_file_url": all_floors.json_file_url,
+            "csv_url": all_floors.csv_url,
+            "total_area_csv_url": all_floors.total_area_csv_url,
+            "image_labelme_side_by_side_url": all_floors.image_labelme_side_by_side_url,
+            "notes": all_floors.notes,
+        }
 
-# class StaticStorage(S3Boto3Storage):
-#     location = "static"
-#     default_acl = "private"
+        # Process CSV floors
+        csv_floors_list = []
+        for csv_floor in all_floors.csv_floors.all():
+            csv_floor_payload = {
+                "floor_name": csv_floor.floor_name,
+                "calculated_total_area_metric": csv_floor.calculated_total_area_metric,
+                "calculated_total_area_imperial": csv_floor.calculated_total_area_imperial,
+            }
+            rooms_list = []
+            for room in csv_floor.rooms.all():
+                room_payload = {
+                    "room_name": room.room_name,
+                    "is_segment": room.is_segment,
+                    "room_id": room.room_id,
+                    "no_of_doors": room.no_of_doors,
+                    "no_of_windows": room.no_of_windows,
+                    "no_of_room_points": room.no_of_room_points,
+                }
+                # Include pixel data if available
+                if hasattr(room, "pixel_data"):
+                    pd = room.pixel_data
+                    room_payload["backup_pixel_data"] = {
+                        "min_x_pixels": pd.min_x_pixels,
+                        "min_y_pixels": pd.min_y_pixels,
+                        "max_x_pixels": pd.max_x_pixels,
+                        "max_y_pixels": pd.max_y_pixels,
+                        "max_area_pixels": pd.max_area_pixels,
+                        "actual_area_pixels": pd.actual_area_pixels,
+                        "pixel_ratio": pd.pixel_ratio,
+                    }
+                # Include dimensions if available
+                if hasattr(room, "dimensions"):
+                    dims = room.dimensions
+                    room_payload["backup_dimensions"] = {
+                        "dimensions_imperial": dims.dimensions_imperial,
+                        "dimensions_metric": dims.dimensions_metric,
+                        "max_area_metric": dims.max_area_metric,
+                        "max_area_imperial": dims.max_area_imperial,
+                        "calculated_sq_area_metric": dims.calculated_sq_area_metric,
+                        # The backup model also has fields for total floor area;
+                        # if you don't have values, send None:
+                        "calculated_floor_total_sq_area_metric": None,
+                        "calculated_area_imperial": dims.calculated_area_imperial,
+                        "calculated_floor_total_sq_area_imperial": None,
+                    }
+                # Include scaling factors if available
+                if hasattr(room, "scaling_factors"):
+                    sf = room.scaling_factors
+                    room_payload["backup_scaling_factors"] = {
+                        "scale_metric": sf.scale_metric,
+                        "scale_imperial": sf.scale_imperial,
+                    }
+                rooms_list.append(room_payload)
+            csv_floor_payload["backup_rooms"] = rooms_list
+            csv_floors_list.append(csv_floor_payload)
+        all_floors_payload["backup_csv_floors"] = csv_floors_list
+        payload["backup_all_floors_data"] = all_floors_payload
 
+    # Process PlanFloor data.
+    backup_plan_floors = []
+    for pf in instance.plan_floors.all():
+        pf_payload = {
+            "floor": pf.floor,
+            "label_me_url": pf.label_me_url,
+            "json_file_url": pf.json_file_url,
+            "image_url": pf.image_url,
+            "labelme_image_url": pf.labelme_image_url,
+            "csv_url": pf.csv_url,
+            "image_side_by_side_url": pf.image_side_by_side_url,
+        }
+        backup_plan_floors.append(pf_payload)
+    payload["backup_plan_floors"] = backup_plan_floors
 
-class MediaStorage(S3Boto3Storage):
-    location = "media"
-    default_acl = "private"
-    file_overwrite = False
+    # Send the payload to the backup endpoint.
+    backup_url = f"{settings.BACKUP_SERVICE_URL}/api/backup/floorplan/"
+    try:
+        response = requests.post(backup_url, json=payload, timeout=5)
+        # If there is a 400 or any HTTP error, log the response details.
+        response.raise_for_status()
+    except requests.HTTPError as e:
+        # Log response content to help pinpoint which field is causing validation to fail.
+        error_details = response.content.decode()
+        print(f"Backup service error details: {error_details}")
+        raise Exception(f"Error backing up floorplan {instance.floorplan_id}: {str(e)}")
 
 

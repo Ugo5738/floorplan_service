@@ -8,4 +8,9 @@ urlpatterns = [
         views.FloorPlanAnalysisView.as_view(),
         name="analyze_floorplans",
     ),
+    path(
+        "webhook/",
+        views.FloorPlanWebhookView.as_view(),
+        name="floorplan_webhook",
+    ),
 ]

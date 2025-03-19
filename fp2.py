@@ -9,6 +9,7 @@ url = "http://165.232.101.36/fpextractor"
 payload = {
     "user_id": "supersami54567",
     "property_id": "rightmove2345",
+    "webhook_url": "https://floorplan.supersami.com/api/floorplan/webhook/",
     "floorplans": {
         "fp1": {
             "url": "https://media.rightmove.co.uk/267k/266045/156762020/266045_S1179014_FLP_00_0001.jpeg",
