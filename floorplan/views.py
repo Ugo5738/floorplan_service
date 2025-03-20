@@ -9,43 +9,45 @@ from floorplan.tasks import process_floorplan_analysis, process_floorplan_webhoo
 class FloorPlanAnalysisView(APIView):
     """
     Endpoint to initiate floorplan analysis.
-    Expects payload with "user_id", "property_id", and "floorplans".
+    Expects a payload with "user_id", "property_id", and "floorplans".
     """
 
     def post(self, request):
         user_id = request.data.get("user_id")
         property_id = request.data.get("property_id")
         floorplans = request.data.get("floorplans")
-
         if not all([user_id, property_id, floorplans]):
             return Response(
                 {"error": "Missing required fields: user_id, property_id, floorplans"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        # Enqueue the analysis task asynchronously.
         process_floorplan_analysis.delay(user_id, property_id, floorplans)
         return Response(
-            {"message": "Floorplan analysis started."}, status=status.HTTP_202_ACCEPTED
+            {"message": "Floorplan analysis initiated."},
+            status=status.HTTP_202_ACCEPTED,
         )
 
 
 class FloorPlanWebhookView(APIView):
     """
     Webhook endpoint to receive analysis results from the analyzer service.
-    Expects payload with "user_id", "property_id", "message", and "output_data".
+
+    Supports two kinds of payloads:
+      - Creation: expects "task": "creation", "message", "user_id", "property_id",
+        and "output_data" (a list of new floorplans).
+      - Update: expects "task": "update", "user_id", "property_id",
+        and "output_data" as an object containing a "floorplan_id" and a "floors" update.
     """
 
     def post(self, request):
         data = request.data
-        required_fields = ["user_id", "property_id", "message", "output_data"]
+        required_fields = ["task", "user_id", "property_id", "output_data"]
         missing_fields = [field for field in required_fields if field not in data]
         if missing_fields:
             return Response(
                 {"error": f"Missing fields in payload: {missing_fields}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        # Enqueue the webhook processing task.
         process_floorplan_webhook.delay(data)
         return Response(
             {"message": "Webhook received. Processing initiated."},
