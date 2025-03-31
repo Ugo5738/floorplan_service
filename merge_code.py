@@ -19,7 +19,7 @@ def should_exclude(file_path):
     return False
 
 
-def merge_code(paths, output_file="merged_code.txt"):
+def merge_code(paths, output_file="merged_output.txt"):
     with open(output_file, "w", encoding="utf-8") as outfile:
         for path in paths:
             if os.path.isfile(path):

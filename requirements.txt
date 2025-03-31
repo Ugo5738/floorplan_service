@@ -13,6 +13,7 @@ django-filter
 django-ratelimit
 django-rest-passwordreset
 django-rest-swagger
+django-simple-history
 django-storages
 djangorestframework
 djangorestframework-simplejwt

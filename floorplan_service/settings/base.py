@@ -32,6 +32,7 @@ THIRD_PARTY_APPS = [
     "django_rest_passwordreset",
     "drf_yasg",
     "drf_spectacular",
+    "simple_history",
     "storages",
     "django.contrib.sites",
     "rest_framework",
@@ -59,6 +60,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",  # Custom added
+    "simple_history.middleware.HistoryRequestMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -250,4 +252,7 @@ ORCHESTRATOR_APP_URL = config("ORCHESTRATOR_APP_URL")
 
 # BACKUP_DB_SERVICE
 BACKUP_SERVICE_URL = config("BACKUP_SERVICE_URL")
+
+FLOORPLAN_WEBHOOK_URL = config("FLOORPLAN_WEBHOOK_URL")
+FLOORPLAN_ANALYZER_URL = config("FLOORPLAN_ANALYZER_URL")
 # ================================ CUSTOM VARIABLES =======================================

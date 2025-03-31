@@ -1,5 +1,7 @@
 from django.db import models
 
+# from simple_history.models import HistoricalRecords
+
 # === API-Level Models ===
 
 
@@ -8,6 +10,7 @@ class FloorPlanAnalysisResult(models.Model):
     user_id = models.CharField(max_length=255)
     property_id = models.CharField(max_length=255)
     created_at = models.DateTimeField(auto_now_add=True)
+    # history = HistoricalRecords()
 
     def __str__(self):
         return f"{self.user_id} - {self.property_id}"
