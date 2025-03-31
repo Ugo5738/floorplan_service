@@ -63,6 +63,8 @@ jobs:
           SCRAPER_SERVICE_URL: ${{ secrets.SCRAPER_SERVICE_URL }}
           ANALYSIS_SERVICE_URL: ${{ secrets.ANALYSIS_SERVICE_URL }}
           BACKUP_SERVICE_URL: ${{ secrets.BACKUP_SERVICE_URL }}
+          FLOORPLAN_WEBHOOK_URL: ${{ secrets.FLOORPLAN_WEBHOOK_URL }}
+          FLOORPLAN_ANALYZER_URL: ${{ secrets.FLOORPLAN_ANALYZER_URL }}
           FRONTEND_APP: ${{ secrets.FRONTEND_APP }}
           NOTIFICATION_SERVICE_URL: ${{ secrets.NOTIFICATION_SERVICE_URL }}
           # ===========================================================
