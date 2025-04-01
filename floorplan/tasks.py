@@ -43,6 +43,7 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
     }
     analyzer_url = settings.FLOORPLAN_ANALYZER_URL
     try:
+        logger.info("Analyzer payload being sent: %s", payload)
         logger.info("Calling analyzer API at %s", analyzer_url)
         response = requests.post(analyzer_url, json=payload)
         response.raise_for_status()

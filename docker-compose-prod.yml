@@ -8,8 +8,8 @@ services:
     restart: always
     command: >
       sh -c " 
-        python manage.py makemigrations &&
-        python manage.py migrate &&  
+        # python manage.py makemigrations &&
+        # python manage.py migrate &&  
         python manage.py populate_db &&
         daphne floorplan_service.asgi:application -b 0.0.0.0 -p 8000
       "
@@ -17,6 +17,8 @@ services:
       - "8000"
     depends_on:
       - redis
+    env_file:
+      - .env
     environment:
       - VIRTUAL_HOST=floorplan.supersami.com
       - LETSENCRYPT_HOST=floorplan.supersami.com
@@ -75,3 +77,5 @@ services:
     depends_on:
       - redis
       - web
+    env_file:
+      - .env
