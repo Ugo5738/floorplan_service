@@ -13,8 +13,6 @@ services:
         python manage.py populate_db &&
         daphne floorplan_service.asgi:application -b 0.0.0.0 -p 8000
       "
-    volumes:
-      - .:/code
     expose:
       - "8000"
     depends_on:
@@ -74,8 +72,6 @@ services:
         echo 'Web and Redis are up - starting celery worker';
         celery -A floorplan_service worker --loglevel=info;
       "
-    volumes:
-      - .:/code
     depends_on:
       - redis
       - web
