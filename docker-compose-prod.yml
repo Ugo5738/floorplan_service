@@ -17,6 +17,8 @@ services:
       - "8000"
     depends_on:
       - redis
+    volumes:
+      - .:/code
     env_file:
       - .env
     environment:
@@ -79,3 +81,5 @@ services:
       - web
     env_file:
       - .env
+    volumes:
+      - .:/code

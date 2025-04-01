@@ -105,7 +105,7 @@ def process_floorplan_webhook(self, analysis_data):
                 type(output_data),
             )
             return {"error": "Invalid output_data format for creation task."}
-
+        logger.info("This is the output data: ", output_data)
         # Create a single AnalysisResult for this creation batch
         analysis_result, created = FloorPlanAnalysisResult.objects.get_or_create(
             user_id=user_id,

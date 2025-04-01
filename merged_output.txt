@@ -1,3 +1,1197 @@
+# .github/workflows/staging.yml
+name: Property Floorplan Backend CI/CD Pipeline (Staging)
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.11"
+      - name: Upgrade pip and Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Tests
+        env:
+          # ===========================================================
+          # ------------------------- GENERAL -------------------------
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          DJANGO_SETTINGS_MODULE: ${{ secrets.DJANGO_SETTINGS_MODULE }}
+
+          # ------------------------- SUPERUSER -------------------------
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          ADMIN_PHONE: ${{ secrets.ADMIN_PHONE }}
+
+          # ------------------------- DATABASE -------------------------
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          # ------------------------- CORS -------------------------
+          CORS_ORIGINS: ${{ secrets.CORS_ORIGINS }}
+
+          # ------------------------- CSRF -------------------------
+          CSRF_TRUSTED_ORIGINS: ${{ secrets.CSRF_TRUSTED_ORIGINS }}
+
+          # ------------------------- TEXT PROCESSING DETAILS -------------------------
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ASSISTANT_ID: ${{ secrets.ASSISTANT_ID }}
+          MODEL_NAME: ${{ secrets.MODEL_NAME}}
+
+          # -------------------------- REDIS CONFIG ----------------------------
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+
+          # -------------------------- CONFIGS ----------------------------
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+
+          # -------------------------- CONFIGS ----------------------------
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_STORAGE_BUCKET_NAME: ${{ secrets.AWS_STORAGE_BUCKET_NAME }}
+
+          # -------------------------- EXTERNAL APPLICATION ----------------------------
+          ORCHESTRATOR_APP_URL: ${{ secrets.ORCHESTRATOR_APP_URL }}
+          SCRAPER_SERVICE_URL: ${{ secrets.SCRAPER_SERVICE_URL }}
+          ANALYSIS_SERVICE_URL: ${{ secrets.ANALYSIS_SERVICE_URL }}
+          BACKUP_SERVICE_URL: ${{ secrets.BACKUP_SERVICE_URL }}
+          FLOORPLAN_WEBHOOK_URL: ${{ secrets.FLOORPLAN_WEBHOOK_URL }}
+          FLOORPLAN_ANALYZER_URL: ${{ secrets.FLOORPLAN_ANALYZER_URL }}
+          FRONTEND_APP: ${{ secrets.FRONTEND_APP }}
+          NOTIFICATION_SERVICE_URL: ${{ secrets.NOTIFICATION_SERVICE_URL }}
+          # ===========================================================
+        run: |
+          python manage.py test
+
+  build-and-push-image:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64 # Builds for both architectures
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:staging-${{ github.sha }}
+            ${{ secrets.DOCKER_HUB_USERNAME }}/floorplan:latest
+  deploy:
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup SSH Key and Add to Known Hosts
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_IP_STAGING }} >> ~/.ssh/known_hosts
+      - name: Install GPG
+        run: sudo apt-get update && sudo apt-get install -y gnupg
+      - name: Decrypt .env.gpg File
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: echo $GPG_PASSPHRASE | gpg --quiet --batch --yes --decrypt --passphrase-fd 0 --output ./.env ./.env.gpg
+      - name: Transfer Repository to Remote Server (Including Decrypted .env)
+        run: rsync -avz -e "ssh -i ~/.ssh/id_rsa" ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP_STAGING }}:/home/ubuntu/floorplan/
+      - name: Deploy to server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_IP_STAGING }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+
+            cd /home/ubuntu/floorplan/
+            # Ensure scripts are executable (in case they are not already)
+            chmod +x install_docker.sh
+            chmod +x entrypoint.sh
+            chmod +x deploy.sh
+
+            # Check if Docker Compose is installed
+            if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+              echo "Installing Docker Compose..."
+              ./install_docker.sh
+              # No need to modify PATH or logout/login; Docker should be immediately usable
+            else
+              echo "Docker Compose already installed."
+            fi
+
+            ./deploy.sh
+
+  cleanup:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup crontab for Docker cleanup
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_IP_STAGING }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            # Define the cron job command with logging
+            CRON_JOB="0 0 * * * /usr/bin/docker system prune -af > /var/log/docker_cleanup.log 2>&1"
+
+            # Create a log file and set permissions (if not already exist)
+            sudo touch /var/log/docker_cleanup.log
+            sudo chmod 644 /var/log/docker_cleanup.log
+
+            # Check if the cleanup cron job already exists for the current user
+            (crontab -l 2>/dev/null | grep -q "docker system prune") || ( (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab - )
+
+            # Ensure the cron service is running
+            sudo service cron restart
+
+            # This cron job is scheduled to run at midnight every day, performing a Docker system prune
+            # to remove unused Docker objects and logs the output to /var/log/docker_cleanup.log.
+
+# username = propertyanalysisai
+# repo name = floorplan
+# .env encrypt with floorplan
+# gpg --symmetric --cipher-algo AES256 --output .env.gpg .env
+
+
+# accounts/models.py
+import uuid
+from datetime import timedelta
+
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from django_countries.fields import CountryField
+
+from helpers.models import TrackingModel
+
+GENDER_CHOICES = (("M", "Male"), ("F", "Female"))
+
+
+class UserManager(BaseUserManager):
+    use_in_migrations = True
+
+    def _create_user(self, email, password, **extra_fields):
+        if not email:
+            raise ValueError("Users require an email field")
+
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_user(self, email, password=None, **extra_fields):
+        extra_fields.setdefault("is_staff", False)
+        extra_fields.setdefault("is_superuser", False)
+        return self._create_user(email, password, **extra_fields)
+
+    def create_superuser(self, email, password, **extra_fields):
+        extra_fields.setdefault("is_staff", True)
+        extra_fields.setdefault("is_superuser", True)
+
+        if extra_fields.get("is_staff") is not True:
+            raise ValueError("Superuser must have is_staff=True.")
+        if extra_fields.get("is_superuser") is not True:
+            raise ValueError("Superuser must have is_superuser=True.")
+
+        return self._create_user(email, password, **extra_fields)
+
+
+class User(AbstractUser, TrackingModel):
+    email = models.EmailField(
+        _("email address"), db_index=True, blank=True, null=True, unique=True
+    )
+    username = models.CharField(
+        _("username"), max_length=30, blank=True, null=True, unique=False
+    )
+    phone = models.CharField(max_length=60, blank=True, null=True)
+    gender = models.CharField(
+        max_length=1, choices=GENDER_CHOICES, blank=True, null=True
+    )
+    date_of_birth = models.DateField(null=True, blank=True)
+    profile_picture = models.ImageField(
+        upload_to="profile_pics/", null=True, blank=True
+    )
+
+    email_verification_token = models.CharField(max_length=128, null=True, blank=True)
+    email_verified = models.BooleanField(
+        _("email verified"),
+        default=False,
+        help_text="Designates whether this users email is verified.",
+    )
+
+    objects = UserManager()
+
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = []
+
+    def __str__(self):
+        return "{}".format(self.email)
+
+    class Meta:
+        verbose_name = _("User")
+        verbose_name_plural = _("Users")
+
+
+class OrganizationProfile(TrackingModel):
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="organization_profile"
+    )
+    name = models.CharField(max_length=100)
+    bio = models.TextField(max_length=500, blank=True, null=True)
+
+    # organization address
+    city = models.CharField(max_length=50, blank=True, null=True)
+    address = models.CharField(max_length=255, null=True, blank=True)
+    address2 = models.CharField(max_length=255, null=True, blank=True)
+    country = CountryField(multiple=False, null=True, blank=True)
+    zip_code = models.CharField(max_length=200, null=True, blank=True)
+
+    def __str__(self):
+        return "{}".format(self.name)
+
+    class Meta:
+        verbose_name = _("Organization")
+        verbose_name_plural = _("Organizations")
+
+
+class UserToken(models.Model):
+    phone_number = models.CharField(max_length=20)
+    token = models.UUIDField(default=uuid.uuid4, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+# accounts/serializers.py
+from django.contrib.auth.password_validation import validate_password
+from rest_framework import serializers
+
+from accounts import models
+
+
+class OrganizationProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.OrganizationProfile
+        # fields = '__all__'
+        fields = ["name", "country"]  # added to registration form
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, validators=[validate_password])
+    country = serializers.CharField(write_only=True, required=False)
+
+    class Meta:
+        model = models.User
+        fields = ["email", "password", "country", "first_name", "last_name"]
+        extra_kwargs = {
+            "first_name": {"required": False},
+            "last_name": {"required": False},
+        }
+
+    def create(self, validated_data):
+        country = validated_data.pop("country", None)
+        user = models.User.objects.create_user(**validated_data)
+        if country:
+            models.OrganizationProfile.objects.create(user=user, country=country)
+        return user
+
+
+class UserSerializer(serializers.ModelSerializer):
+    full_name = serializers.CharField(source="get_full_name", read_only=True)
+    user_role = serializers.CharField(source="get_user_role", read_only=True)
+
+    class Meta:
+        model = models.User
+        # fields = '__all__'
+        exclude = ["password", "groups", "user_permissions"]
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """
+    Serializer for password change endpoint.
+    """
+
+    old_password = serializers.CharField(required=True)
+    new_password = serializers.CharField(required=True)
+
+
+class ResetPasswordRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+# accounts/__init__.py
+
+
+# accounts/apps.py
+from django.apps import AppConfig
+
+
+class AccountsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "accounts"
+
+
+# accounts/forms.py
+from django import forms
+from django.contrib.auth.forms import (
+    AuthenticationForm,
+    PasswordChangeForm,
+    PasswordResetForm,
+    UserCreationForm,
+)
+from django.utils.translation import gettext_lazy as _
+
+from accounts.models import User
+
+
+class UserLoginForm(AuthenticationForm):
+    username = forms.EmailField(
+        required=True,
+        label=_("Email: "),
+        widget=forms.TextInput(
+            attrs={
+                "type": "email",
+                "class": "form-control form-control-user",
+                "id": "exampleInputEmail",
+                "aria-describedby": "emailHelp",
+                "placeholder": "Enter Email Address...",
+            }
+        ),
+    )
+    password = forms.CharField(
+        widget=forms.PasswordInput(
+            attrs={
+                "type": "password",
+                "class": "form-control form-control-user",
+                "placeholder": "Password",
+                "id": "exampleInputPassword",
+            }
+        )
+    )
+
+    # ADD REMEMBER ME
+    class Meta:
+        model = User
+        fields = ("username", "password")
+
+
+class SignUpForm(UserCreationForm):
+    email = forms.EmailField(
+        max_length=254,
+        required=True,
+        help_text=_("Required. Enter a valid email address."),
+        widget=forms.EmailInput(
+            attrs={
+                "class": "form-control form-control-user",
+                "id": "exampleInputEmail",
+                "type": "email",
+                "placeholder": "Email Address",
+            }
+        ),
+    )
+    first_name = forms.CharField(
+        max_length=30,
+        required=True,
+        help_text=_("Enter First Name."),
+        widget=forms.TextInput(
+            attrs={
+                "type": "text",
+                "class": "form-control form-control-user",
+                "id": "exampleFirstName",
+                "placeholder": "First Name",
+            }
+        ),
+    )
+    last_name = forms.CharField(
+        max_length=30,
+        required=True,
+        help_text=_("Enter Last Name."),
+        widget=forms.TextInput(
+            attrs={
+                "type": "text",
+                "class": "form-control form-control-user",
+                "id": "exampleLastName",
+                "placeholder": "Last Name",
+            }
+        ),
+    )
+    password1 = forms.CharField(
+        max_length=22,
+        min_length=8,
+        required=True,
+        widget=forms.PasswordInput(
+            attrs={
+                "class": "form-control form-control-user",
+                "id": "exampleInputPassword",
+                "type": "password",
+                "placeholder": "Password",
+                "maxlength": "22",
+                "minlength": "8",
+            }
+        ),
+    )
+    password2 = forms.CharField(
+        max_length=22,
+        min_length=8,
+        required=True,
+        widget=forms.PasswordInput(
+            attrs={
+                "class": "form-control form-control-user",
+                "id": "exampleInputPassword",
+                "type": "password",
+                "placeholder": "Repeat Password",
+                "maxlength": "22",
+                "minlength": "8",
+            }
+        ),
+    )
+
+    def clean_email(self):
+        email = self.cleaned_data.get("email")
+        if email and User.objects.filter(email=email).exists():
+            raise forms.ValidationError(
+                f"This email address is already in use. Please use a different email."
+            )
+        return email
+
+    class Meta:
+        model = User
+        fields = (
+            "email",
+            "first_name",
+            "last_name",
+            "password1",
+            "password2",
+            "phone",  # Not sure this is needed it is not in the front page
+        )
+
+
+class CustomPasswordResetForm(PasswordResetForm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["email"].widget.attrs.update(
+            {
+                "class": "form-control form-control-user",
+                "placeholder": "Enter Email Address...",
+            }
+        )
+
+
+class ChangePasswordForm(PasswordChangeForm):
+    old_password = forms.CharField(
+        widget=forms.TextInput(
+            attrs={"class": "form-control mb-3", "placeholder": "Old Password"}
+        ),
+    )
+    new_password1 = forms.CharField(
+        widget=forms.TextInput(
+            attrs={"class": "form-control mb-3", "placeholder": "New Password"}
+        ),
+    )
+    new_password2 = forms.CharField(
+        widget=forms.TextInput(
+            attrs={"class": "form-control mb-3", "placeholder": "Confirm New Password"}
+        ),
+    )
+
+    class Meta:
+        model = User
+        fields = (
+            "old_password",
+            "new_password1",
+            "new_password2",
+        )
+
+
+# accounts/admin.py
+from django.contrib import admin
+from django.utils.html import format_html
+
+from accounts.models import OrganizationProfile, User, UserToken
+
+
+class UserAdmin(admin.ModelAdmin):
+    list_display = [
+        "id",
+        "email",
+        "username",
+        "phone",
+        "gender",
+        "email_verified",
+    ]
+    list_filter = ["email_verified", "date_of_birth"]
+    search_fields = ["email", "username", "phone"]
+
+
+class OrganizationProfileAdmin(admin.ModelAdmin):
+    list_display = ["id", "name", "bio", "city", "address", "country", "zip_code"]
+    list_filter = ["city", "country"]
+    search_fields = ["name", "bio", "city", "address", "zip_code"]
+    raw_id_fields = ["user"]
+
+
+class UserTokenAdmin(admin.ModelAdmin):
+    list_display = [
+        "phone_number",
+        "token",
+        "created_at",
+    ]
+    list_filter = ["phone_number"]
+    search_fields = ["phone_number"]
+
+
+admin.site.register(User, UserAdmin)
+admin.site.register(OrganizationProfile, OrganizationProfileAdmin)
+admin.site.register(UserToken, UserTokenAdmin)
+
+
+# accounts/pagination.py
+from rest_framework import pagination
+
+
+class CustomPageNumberPagination(pagination.PageNumberPagination):
+    page_size = 1
+    page_size_query_param = "count"
+    max_page_size = 5
+    page_query_param = "p"
+
+
+# accounts/tests.py
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# accounts/urls.py
+from django.conf import settings
+from django.conf.urls.static import static
+from django.contrib.auth import views as auth_views
+from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+from django.urls import include, path
+from rest_framework import routers
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+    TokenVerifyView,
+)
+
+from accounts import forms, views
+
+router = routers.DefaultRouter()
+
+router.register(r"users", views.UserViewSet, basename="user")
+
+admin_urls = [
+    path("", include(router.urls)),
+    path("user/", views.CurrentUserDetailView.as_view(), name="current_user"),
+]
+
+manual_tokens = [
+    path(
+        "generate-token/",
+        views.GenerateTokenView.as_view(),
+        name="generate_auth",
+    ),
+    path(
+        "authenticate-token/",
+        views.TokenAuthenticationView.as_view(),
+        name="authenticate_auth",
+    ),
+    path(
+        "authenticate-phone/",
+        views.PhoneAuthenticationView.as_view(),
+        name="authenticate-phone",
+    ),
+    path(
+        "check-authenticated/",
+        views.CheckAuthenticatedView.as_view(),
+        name="check-authenticated",
+    ),
+]
+
+jwt_urls = [
+    path("token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
+    path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path("token/verify/", TokenVerifyView.as_view(), name="token_verify"),
+    path("change-password", views.ChangePasswordView.as_view(), name="change_password"),
+    path(
+        "password-reset/",
+        include("django_rest_passwordreset.urls", namespace="password_reset"),
+    ),
+]
+
+account_urls = [
+    # path("signup/", views.RegisterAPIView.as_view(), name="signup"),
+    # path('verify-email/<str:token>/', views.VerifyEmailView.as_view(), name='verify_email'),
+    # path('resend-verification/', views.ResendVerificationEmailView.as_view(), name='resend_verification'),
+    path(
+        "login/",
+        auth_views.LoginView.as_view(
+            template_name="account/login.html", authentication_form=forms.UserLoginForm
+        ),
+        name="login",
+    ),
+    # path("logout/", auth_views.LogoutView.as_view(), name="logout"),
+    path("logout/", views.LogoutView.as_view(), name="auth_logout"),
+]
+
+password_urls = [
+    # path("change-password/", views.ChangePassword.as_view(), name="change_password"),
+    path(
+        "password-reset/",
+        auth_views.PasswordResetView.as_view(
+            form_class=forms.CustomPasswordResetForm,
+            template_name="account/password/password_reset.html",
+            subject_template_name="account/password/password_reset_subject.txt",
+            email_template_name="account/password/password_reset_email.html",
+            from_email=settings.EMAIL_HOST_USER,
+            # success_url='/login/'
+        ),
+        name="password_reset",
+    ),
+    path(
+        "password-reset/done/",
+        auth_views.PasswordResetDoneView.as_view(
+            template_name="account/password/password_reset_done.html"
+        ),
+        name="password_reset_done",
+    ),
+    path(
+        "password-reset-confirm/<uidb64>/<token>/",
+        auth_views.PasswordResetConfirmView.as_view(
+            template_name="account/password/password_reset_confirm.html"
+        ),
+        name="password_reset_confirm",
+    ),
+    path(
+        "password-reset-complete/",
+        auth_views.PasswordResetCompleteView.as_view(
+            template_name="account/password/password_reset_complete.html"
+        ),
+        name="password_reset_complete",
+    ),
+]
+
+urlpatterns = admin_urls + jwt_urls + account_urls + password_urls + manual_tokens
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+urlpatterns += staticfiles_urlpatterns()
+
+
+# accounts/views.py
+import uuid
+from datetime import timedelta
+from typing import Any
+
+import jwt
+from django.conf import settings
+from django.contrib.auth import authenticate, login
+from django.core.mail import send_mail
+from django.http import JsonResponse
+from django.middleware.csrf import get_token
+from django.shortcuts import redirect
+from django.utils import timezone
+from django.utils.crypto import get_random_string
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, generics, status, viewsets
+from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.generics import GenericAPIView
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken, TokenError
+
+from accounts.models import User, UserToken
+from accounts.pagination import CustomPageNumberPagination
+from accounts.serializers import (
+    ChangePasswordSerializer,
+    RegisterSerializer,
+    UserSerializer,
+)
+
+# from utils.email_utils import send_verification_email
+
+
+@method_decorator(ensure_csrf_cookie, name="dispatch")
+class GetCSRFToken(APIView):
+    def get(self, request):
+        csrf_token = get_token(request)
+        return JsonResponse({"success": "CSRF cookie set", "csrftoken": csrf_token})
+
+
+class GenerateTokenView(APIView):
+    """
+    Generate authentication token for phone number.
+
+    This endpoint generates a new token or retrieves an existing one for the provided phone number.
+    """
+
+    def post(self, request):
+        """
+        Generate token for authentication.
+
+        Parameters:
+            phone_number (str): User's phone number
+
+        Returns:
+            token (str): Generated authentication token
+
+        Raises:
+            400: If phone number is not provided
+        """
+        phone_number = request.data.get("phone_number")
+        if not phone_number:
+            return Response(
+                {"error": "Phone number is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_token, created = UserToken.objects.get_or_create(phone_number=phone_number)
+        return Response({"token": str(user_token.token)}, status=status.HTTP_200_OK)
+
+
+class TokenAuthenticationView(APIView):
+    """
+    Authenticate user using generated token.
+
+    This endpoint validates the token and returns JWT tokens for further authentication.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        """
+        Authenticate using token.
+
+        Parameters:
+            token (str): Authentication token previously generated
+
+        Returns:
+            refresh (str): JWT refresh token
+            access (str): JWT access token
+            message (str): Success message
+            user (dict): User details including id and phone
+
+        Raises:
+            400: If token is invalid or not provided
+        """
+        token = request.data.get("token")
+        if not token:
+            return Response(
+                {"error": "Token is required."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user_token = UserToken.objects.get(token=token)
+
+            # Get or create the user
+            user, created = User.objects.get_or_create(phone=user_token.phone_number)
+
+            # Generate JWT tokens with additional claims
+            refresh = RefreshToken.for_user(user)
+            refresh["phone"] = user.phone  # Add phone number to token claims
+            refresh["user_id"] = user.id  # Add the user_id claim
+            access_token = str(refresh.access_token)
+
+            return Response(
+                {
+                    "refresh": str(refresh),
+                    "access": access_token,
+                    "message": "Authenticated successfully.",
+                    "user": {"id": user.id, "phone": user.phone},
+                },
+                status=status.HTTP_200_OK,
+            )
+        except UserToken.DoesNotExist:
+            return Response(
+                {"error": "Invalid token."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class PhoneAuthenticationView(APIView):
+    def post(self, request):
+        phone_number = request.data.get("phone_number")
+        if not phone_number:
+            return Response(
+                {"error": "Phone number is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Best practice, send an OTP here
+        # For now, we'll authenticate directly (Note: This is not secure)
+        user, created = User.objects.get_or_create(phone=phone_number)
+
+        # Generate JWT tokens with additional claims
+        refresh = RefreshToken.for_user(user)
+        refresh["phone"] = user.phone  # Add phone number to token claims
+        access_token = str(refresh.access_token)
+
+        return Response(
+            {
+                "refresh": str(refresh),
+                "access": access_token,
+                "message": "Authenticated successfully.",
+                "user": {"id": user.id, "phone": user.phone},
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CheckAuthenticatedView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        print("This is the user: ", request.user.phone)
+        return Response({"message": "Authenticated"}, status=status.HTTP_200_OK)
+
+
+# class RegisterAPIView(GenericAPIView):
+#     """
+#     API endpoint that allows users to be created.
+
+#     Expected payload:
+#     {
+#         "password": "password",
+#         "first_name": "John",
+#         "last_name": "Doe",
+#         "email": "johndoe@example.com",
+#         "country": "NG"
+#     }
+#     """
+#     permission_classes = [AllowAny]
+#     authentication_classes = []
+#     serializer_class = RegisterSerializer
+
+#     def post(self, request: Request) -> Response:
+#         serializer = self.serializer_class(data=request.data)
+
+#         if serializer.is_valid():
+#             user = serializer.save()
+#             user.email_verified = False  # Set email_verified to False initially
+#             user.email_verification_token = get_random_string(64)
+#             user.save()
+
+#             # Send verification email
+#             verification_link = f"{settings.FRONTEND_BASE_URL}/verify-email/{user.email_verification_token}"
+#             email_response = send_verification_email(user.email, verification_link)
+
+#             if email_response.status_code == 200:
+#                 return Response({
+#                     "message": "User registered successfully. Please check your email to verify your account.",
+#                     "user_id": user.id
+#                 }, status=status.HTTP_201_CREATED)
+#             else:
+#                 return Response({
+#                     "message": "User registered successfully, but there was an issue sending the verification email. Please try again later.",
+#                     "user_id": user.id
+#                 }, status=status.HTTP_201_CREATED)
+#         else:
+#             print("Data not valid")
+#             errors = {}
+#             for field, field_errors in serializer.errors.items():
+#                 errors[field] = field_errors[0]  # Take the first error message for each field
+
+#             if 'email' in errors and 'unique' in errors['email'].lower():
+#                 errors['email'] = "A user with this email already exists."
+
+#             if 'password' in errors:
+#                 if 'too short' in errors['password'].lower():
+#                     errors['password'] = "Password is too short. It must be at least 8 characters long."
+#                 elif 'too common' in errors['password'].lower():
+#                     errors['password'] = "This password is too common. Please choose a more unique password."
+#                 elif 'entirely numeric' in errors['password'].lower():
+#                     errors['password'] = "Password cannot be entirely numeric."
+
+#             return Response({"errors": errors}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# class VerifyEmailView(APIView):
+#     def get(self, request, token):
+#         try:
+#             user = User.objects.get(email_verification_token=token)
+#             user.email_verified = True
+#             # user.email_verification_token = ''
+#             user.save()
+#             return Response({"message": "Email verified successfully"}, status=status.HTTP_200_OK)
+#         except User.DoesNotExist:
+#             return Response({"message": "Invalid token"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# class ResendVerificationEmailView(APIView):
+#     def post(self, request):
+#         email = request.data.get('email')
+#         if not email:
+#             return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+#         try:
+#             user = User.objects.get(email=email)
+#             if user.email_verified:
+#                 return Response({"message": "Email is already verified"}, status=status.HTTP_400_BAD_REQUEST)
+
+#             user.email_verification_token = get_random_string(64)
+#             user.save()
+
+#             verification_link = f"{settings.FRONTEND_BASE_URL}/verify-email/{user.email_verification_token}"
+#             email_response = send_verification_email(user.email, verification_link)
+
+#             if email_response.status_code == 200:
+#                 return Response({"message": "Verification email resent successfully"}, status=status.HTTP_200_OK)
+#             else:
+#                 return Response({"message": "Failed to resend verification email"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+#         except User.DoesNotExist:
+#             return Response({"error": "User with this email does not exist"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class LoginView(APIView):
+    def post(self, request: Request) -> Response:
+        email = request.data.get("email")
+        password = request.data.get("password")
+
+        if not email:
+            return Response(
+                {"errors": {"email": ["Email is required"]}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not password:
+            return Response(
+                {"errors": {"password": ["Password is required"]}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = authenticate(email=email, password=password)
+
+        if user is not None:
+            if not user.email_verified:
+                return Response(
+                    {
+                        "errors": {
+                            "email": ["Please verify your email before logging in"]
+                        }
+                    },
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            refresh = RefreshToken.for_user(user)
+            return Response(
+                {
+                    "refresh": str(refresh),
+                    "access": str(refresh.access_token),
+                }
+            )
+
+        user_exists = User.objects.filter(email=email).exists()
+        if user_exists:
+            return Response(
+                {"errors": {"password": ["Invalid password"]}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        else:
+            return Response(
+                {"errors": {"email": ["No account found with this email"]}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+
+class LogoutView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        try:
+            refresh_token = request.data.get("refresh_token")
+            if not refresh_token:
+                return Response(
+                    {"error": "Refresh token is required"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response(status=status.HTTP_205_RESET_CONTENT)
+        except TokenError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            print("This is the error", e)
+            return Response(
+                {"error": "An unexpected error occurred"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint that allows users to be viewed, edited and searched.
+    """
+
+    queryset = User.objects.exclude(is_superuser=True)
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = CustomPageNumberPagination
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    ]
+
+    lookup_field = "id"
+    filterset_fields = ["id", "username", "email"]
+    search_fields = ["id", "username", "email"]
+    ordering_fields = ["id", "username", "email"]
+
+
+class UserView(APIView):
+    def get(self, request: Request) -> Response:
+        token = request.COOKIES.get("jwt")
+
+        if not token:
+            raise AuthenticationFailed("Unauthenticated")
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            raise AuthenticationFailed("Authentication Expired")
+
+        user = User.objects.filter(id=payload["id"]).first()
+        serializer = UserSerializer(user)
+        return Response(serializer.data)
+
+
+class CurrentUserDetailView(APIView):
+    """
+    An endpoint to get the current logged in users' details.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        serializer = UserSerializer(request.user)
+        return Response(serializer.data)
+
+
+class ChangePasswordView(generics.UpdateAPIView):
+    """
+    An endpoint for changing password.
+    """
+
+    serializer_class = ChangePasswordSerializer
+    model = User
+    permission_classes = (IsAuthenticated,)
+
+    def get_object(self, queryset=None):
+        return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+
+        if serializer.is_valid():
+            # Check old password
+            if not self.object.check_password(serializer.data.get("old_password")):
+                return Response(
+                    {"old_password": ["Wrong password."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # set_password also hashes the password that the user will get
+            self.object.set_password(serializer.data.get("new_password"))
+            self.object.save()
+
+            response = {
+                "status": "success",
+                "code": status.HTTP_200_OK,
+                "message": "Password updated successfully",
+            }
+
+            return Response(response)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# accounts/management/__init__.py
+
+
+# accounts/management/commands/__init__.py
+
+
+# accounts/management/commands/populate_db.py
+from typing import Any
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand
+from django.db import IntegrityError
+
+# from accounts.factories import OrganizationProfileFactory, UserFactory
+
+
+class Command(BaseCommand):
+    help = "Populates the database with dummy data"
+
+    def handle(self, *args: Any, **options: Any) -> None:
+        User = get_user_model()
+
+        # Set your custom superuser data
+        username: str = settings.ADMIN_USERNAME
+        email: str = settings.ADMIN_EMAIL
+        phone: str = settings.ADMIN_PHONE
+
+        password: str = settings.ADMIN_PASSWORD
+
+        try:
+            # Attempt to create a new superuser
+            User.objects.create_superuser(
+                username=username, phone=phone, email=email, password=password
+            )
+            self.stdout.write(
+                self.style.SUCCESS(f"Superuser {phone} created successfully")
+            )
+        except IntegrityError:
+            self.stdout.write(self.style.WARNING(f"Superuser {phone} already exists"))
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"An error occurred: {str(e)}"))
+
+        # # Create Users
+        # for _ in range(10):
+        #     UserFactory.create()
+
+        # # Create Organization Profiles
+        # for _ in range(5):
+        #     OrganizationProfileFactory.create()
+
+        # # ... create other objects
+
+        self.stdout.write(
+            self.style.SUCCESS("Successfully populated the database with dummy data")
+        )
+
+
 # floorplan/signals.py
 # from django.db.models.signals import post_save
 # from django.dispatch import receiver
@@ -14,6 +1208,114 @@
 #     except Exception as e:
 #         # Log error; you may want to implement retry logic or asynchronous backup here.
 #         print("Error backing up property:", e)
+
+
+# SAMPLES
+# {
+#     "task": "update",
+#     "user_id": "supersami54567",
+#     "property_id": "rightmove2345",
+#     "output_data": {
+#         "floorplan_id": "fp1",
+#         "floors": {
+#             "floor": "first_floor",  # floor that is to be updated
+#             "label_me_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor",
+#             "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor.json",
+#             "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor.png",
+#             "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor_labelmes.png",
+#             "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor.csv",
+#             "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_supersami54567_property_rightmove2345/floorid_fp1/first_floor/first_floor_side_by_side_labelme.png",
+#         },
+#     },
+# }
+
+
+# {
+#     "user_id": "supersami54567",
+#     "property_id": "rightmove2345",
+#     "webhook_url": "https://webhook.site/045c3250-4281-473f-afab-60efed651a28",
+#     "floorplans": {
+#         "fp1": {
+#             "url": "https://i.postimg.cc/B6gf1wmL/1-FP-Data-1.png",
+#             "notes": "this is first floor.",
+#         },
+#         "fp2": {
+#             "url": "https://i.postimg.cc/d1vK3Kjc/2-FP-Data-2.png",
+#             "notes": "this is second floor.",
+#         },
+#     },
+# }
+
+# {
+#     "task": "creation",
+#     "message": "Floor plans processed successfully",
+#     "user_id": "supersami54567",
+#     "property_id": "rightmove2345",
+#     "output_data": [
+#         {
+#             "floorplan_id": "fp1",
+#             "original_url": "https://i.postimg.cc/B6gf1wmL/1-FP-Data-1.png",
+#             "all_floors": {
+#                 "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/all_floors_json.json",
+#                 "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/all_floors.csv",
+#                 "total_area_csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/total_area.csv",
+#                 "image_labelme_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/side_by_side_labelme.png",
+#                 "notes": "this is first floor.",
+#             },
+#             "floors": [
+#                 {
+#                     "floor": "first_floor",
+#                     "label_me_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/first_floor",
+#                     "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/first_floor/first_floor.json",
+#                     "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/first_floor/first_floor.png",
+#                     "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/first_floor/first_floor_labelmes.png",
+#                     "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/first_floor/first_floor.csv",
+#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/first_floor/first_floor_side_by_side_labelme.png",
+#                 },
+#                 {
+#                     "floor": "ground_floor",
+#                     "label_me_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/ground_floor",
+#                     "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/ground_floor/ground_floor.json",
+#                     "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/ground_floor/ground_floor.png",
+#                     "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/ground_floor/ground_floor_labelmes.png",
+#                     "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/ground_floor/ground_floor.csv",
+#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp1/ground_floor/ground_floor_side_by_side_labelme.png",
+#                 },
+#             ],
+#         },
+#         {
+#             "floorplan_id": "fp2",
+#             "original_url": "https://i.postimg.cc/d1vK3Kjc/2-FP-Data-2.png",
+#             "all_floors": {
+#                 "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/all_floors_json.json",
+#                 "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/all_floors.csv",
+#                 "total_area_csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/total_area.csv",
+#                 "image_labelme_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/side_by_side_labelme.png",
+#                 "notes": "this is first floor.",
+#             },
+#             "floors": [
+#                 {
+#                     "floor": "1st_floor",
+#                     "label_me_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/1st_floor",
+#                     "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/1st_floor/1st_floor.json",
+#                     "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/1st_floor/1st_floor.png",
+#                     "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/1st_floor/1st_floor_labelmes.png",
+#                     "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/1st_floor/1st_floor.csv",
+#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/1st_floor/1st_floor_side_by_side_labelme.png",
+#                 },
+#                 {
+#                     "floor": "ground_floor",
+#                     "label_me_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/ground_floor",
+#                     "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/ground_floor/ground_floor.json",
+#                     "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/ground_floor/ground_floor.png",
+#                     "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/ground_floor/ground_floor_labelmes.png",
+#                     "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/ground_floor/ground_floor.csv",
+#                     "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_123_property_1/floorid_fp2/ground_floor/ground_floor_side_by_side_labelme.png",
+#                 },
+#             ],
+#         },
+#     ],
+# }
 
 
 # floorplan/tasks.py
@@ -62,6 +1364,7 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
     }
     analyzer_url = settings.FLOORPLAN_ANALYZER_URL
     try:
+        logger.info("Analyzer payload being sent: %s", payload)
         logger.info("Calling analyzer API at %s", analyzer_url)
         response = requests.post(analyzer_url, json=payload)
         response.raise_for_status()
@@ -123,7 +1426,7 @@ def process_floorplan_webhook(self, analysis_data):
                 type(output_data),
             )
             return {"error": "Invalid output_data format for creation task."}
-
+        logger.info("This is the output data: ", output_data)
         # Create a single AnalysisResult for this creation batch
         analysis_result, created = FloorPlanAnalysisResult.objects.get_or_create(
             user_id=user_id,
@@ -1384,5 +2687,154 @@ def backup_floorplan(instance):
         error_details = response.content.decode()
         print(f"Backup service error details: {error_details}")
         raise Exception(f"Error backing up floorplan {instance.floorplan_id}: {str(e)}")
+
+
+# deploy.sh
+#!/bin/bash
+
+# Load environment variables from .env
+set -a
+source .env
+set +a
+
+# Stop and remove current containers first (ensures clean slate)
+echo "Stopping and removing current containers..."
+docker compose -f docker-compose-prod.yml down --remove-orphans # Added --remove-orphans
+
+# Start containers with the updated image, forcing a pull
+echo "Starting containers, ensuring latest image is pulled..."
+# No need for separate docker pull if using --pull always
+# docker pull $DOCKER_IMAGE
+docker compose -f docker-compose-prod.yml up -d --pull always --remove-orphans
+
+echo "Deployment completed successfully."
+
+# docker-compose-prod.yml
+services:
+  web:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: ${DOCKER_IMAGE}
+    container_name: floorplan-app
+    restart: always
+    command: >
+      sh -c " 
+        # python manage.py makemigrations &&
+        # python manage.py migrate &&  
+        python manage.py populate_db &&
+        daphne floorplan_service.asgi:application -b 0.0.0.0 -p 8000
+      "
+    expose:
+      - "8000"
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    environment:
+      - VIRTUAL_HOST=floorplan.supersami.com
+      - LETSENCRYPT_HOST=floorplan.supersami.com
+      - LETSENCRYPT_EMAIL=rolfgroenewold@gmail.com
+
+  redis:
+    image: redis:latest
+    container_name: floorplan-app-redis
+
+  nginx-proxy:
+    image: jwilder/nginx-proxy
+    container_name: nginx_reverse_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./nginx/vhost.d:/etc/nginx/vhost.d
+      - ./nginx/html:/usr/share/nginx/html
+      # - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    environment:
+      - DEFAULT_HOST=floorplan.supersami.com
+
+  letsencrypt-nginx-proxy-companion:
+    image: jrcs/letsencrypt-nginx-proxy-companion
+    container_name: nginx_letsencrypt
+    depends_on:
+      - nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/etc/nginx/certs:rw
+      - ./nginx/vhost.d:/etc/nginx/vhost.d
+      - ./nginx/html:/usr/share/nginx/html
+      - ./nginx/acme.sh:/etc/acme.sh
+    environment:
+      - NGINX_PROXY_CONTAINER=nginx_reverse_proxy
+      - DEFAULT_EMAIL=rolfgroenewold@gmail.com
+
+  celery:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: ${DOCKER_IMAGE}
+    container_name: floorplan-app-celery
+    restart: always
+    command: >
+      sh -c "
+        echo 'Waiting for floorplan-app and redis...';
+        while ! nc -z floorplan-app 8000 || ! nc -z redis 6379; do
+          sleep 1;
+        done;
+        echo 'Web and Redis are up - starting celery worker';
+        celery -A floorplan_service worker --loglevel=info;
+      "
+    depends_on:
+      - redis
+      - web
+    env_file:
+      - .env
+
+
+# Dockerfile
+# Pull the base image
+FROM python:3.9
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Install necessary system dependencies
+RUN apt-get update -y && \
+    apt-get install -y \
+    openjdk-17-jdk \
+    netcat-openbsd \
+    wget \
+    gnupg \
+    curl \
+    chromium \
+    chromium-driver
+
+# Install Node.js for Playwright
+RUN curl -fsSL https://deb.nodesource.com/setup_21.x | bash - && \
+    apt-get install -y nodejs
+
+# Clean up APT when done
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set work directory
+WORKDIR /code
+
+# Copy project
+COPY . /code/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Set execute permission for entrypoint.sh
+RUN chmod +x /code/entrypoint.sh
+
+ENTRYPOINT ["/code/entrypoint.sh"]
+
+# Run the application
+CMD ["daphne", "floorplan_service.asgi:application", "--port", "$PORT", "--bind", "0.0.0.0"]
 
 
