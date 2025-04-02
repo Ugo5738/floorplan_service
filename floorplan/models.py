@@ -26,8 +26,12 @@ class FloorPlan(models.Model):
     original_url = models.URLField()
     history = HistoricalRecords()
 
+    class Meta:
+        # Enforce uniqueness for the combination within this model
+        unique_together = ("analysis_result", "floorplan_id")
+
     def __str__(self):
-        return self.floorplan_id
+        return f"{self.floorplan_id} (Analysis: {self.analysis_result_id})"
 
 
 class AllFloorsData(models.Model):

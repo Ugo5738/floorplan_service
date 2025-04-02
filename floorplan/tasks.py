@@ -152,9 +152,9 @@ def process_floorplan_webhook(self, analysis_data):
 
             # Create or update FloorPlan (useful if somehow retried)
             floorplan, fp_created = FloorPlan.objects.update_or_create(
+                analysis_result=analysis_result,
                 floorplan_id=floorplan_id,
                 defaults={
-                    "analysis_result": analysis_result,
                     "original_url": original_url,
                 },
             )
