@@ -50,8 +50,8 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
         logger.info("Analyzer API initiated analysis successfully")
     except requests.RequestException as e:
         logger.error("Failed to call analyzer API: %s", str(e))
-        # Consider raising an exception here for Celery retry or marking failure
-        raise self.retry(exc=e, countdown=60)  # Example retry
+        # Celery retry or marking failure
+        raise self.retry(exc=e, countdown=60)
     except AttributeError:
         logger.error(
             "Missing FLOORPLAN_WEBHOOK_URL or FLOORPLAN_ANALYZER_URL in settings."
@@ -105,27 +105,36 @@ def process_floorplan_webhook(self, analysis_data):
                 type(output_data),
             )
             return {"error": "Invalid output_data format for creation task."}
-        logger.info("This is the output data: ", output_data)
-        # Create a single AnalysisResult for this creation batch
-        analysis_result, created = FloorPlanAnalysisResult.objects.get_or_create(
-            user_id=user_id,
-            property_id=property_id,
-            # Use a unique identifier if possible, or rely on get_or_create with user/property
-            defaults={"message": message},
-        )
-        if created:
-            logger.info(
-                "Created FloorPlanAnalysisResult with id=%s via webhook (creation)",
-                analysis_result.id,
+
+        try:
+            # Create a single AnalysisResult for this creation batch
+            analysis_result, created = FloorPlanAnalysisResult.objects.get_or_create(
+                user_id=user_id,
+                property_id=property_id,
+                # Use a unique identifier if possible, or rely on get_or_create with user/property
+                defaults={"message": message},
             )
-        else:
-            # Decide how to handle if analysis result already exists - update message? log?
-            analysis_result.message = message
-            analysis_result.save()
+            action = "Created" if created else "Updated"
             logger.info(
-                "Found existing FloorPlanAnalysisResult with id=%s, updated message.",
+                "%s FloorPlanAnalysisResult (ID: %s) for user %s, property %s.",
+                action,
                 analysis_result.id,
+                user_id,
+                property_id,
             )
+        except Exception as e:
+            # Catch potential errors during the update_or_create itself
+            logger.error(
+                "Error during update_or_create for FloorPlanAnalysisResult (user: %s, property: %s): %s",
+                user_id,
+                property_id,
+                str(e),
+                exc_info=True,
+            )
+            return {"error": "Failed to process analysis result header."}
+        # --- End update_or_create block ---
+
+        logger.info("Processing output data: %s", output_data)
 
         for item in output_data:
             floorplan_id = item.get("floorplan_id")
@@ -149,6 +158,8 @@ def process_floorplan_webhook(self, analysis_data):
                     "original_url": original_url,
                 },
             )
+            action_fp = "Created" if fp_created else "Updated"
+            logger.info("%s FloorPlan with id=%s", action_fp, floorplan_id)
 
             # Create or update AllFloorsData
             all_floors_data, afd_created = AllFloorsData.objects.update_or_create(
@@ -163,14 +174,12 @@ def process_floorplan_webhook(self, analysis_data):
                     "notes": all_floors_item.get("notes", ""),
                 },
             )
-            if afd_created:
-                logger.info(
-                    "Created AllFloorsData for floorplan_id=%s", floorplan.floorplan_id
-                )
-            else:
-                logger.info(
-                    "Updated AllFloorsData for floorplan_id=%s", floorplan.floorplan_id
-                )
+            action_afd = "Created" if afd_created else "Updated"
+            logger.info(
+                "%s AllFloorsData for floorplan_id=%s",
+                action_afd,
+                floorplan.floorplan_id,
+            )
 
             # Process PlanFloors
             existing_plan_floor_names = set(
@@ -188,7 +197,7 @@ def process_floorplan_webhook(self, analysis_data):
                 current_plan_floor_names.add(floor_name)
                 pf, pf_created = PlanFloor.objects.update_or_create(
                     floor_plan=floorplan,
-                    floor=floor_name,
+                    floor=floor_name,  # Assumes (floor_plan, floor) is unique
                     defaults={
                         "label_me_url": floor_data.get("label_me_url"),
                         "json_file_url": floor_data.get("json_file_url"),
@@ -202,10 +211,8 @@ def process_floorplan_webhook(self, analysis_data):
                         ),
                     },
                 )
-                if pf_created:
-                    logger.info("Created PlanFloor for floor=%s", floor_name)
-                else:
-                    logger.info("Updated PlanFloor for floor=%s", floor_name)
+                action_pf = "Created" if pf_created else "Updated"
+                logger.info("%s PlanFloor for floor=%s", action_pf, floor_name)
 
             # Optional: Remove PlanFloors that are no longer present in the data
             floors_to_remove = existing_plan_floor_names - current_plan_floor_names
@@ -235,11 +242,12 @@ def process_floorplan_webhook(self, analysis_data):
                     logger.error(
                         "Failed to download or process CSV from %s: %s", csv_url, str(e)
                     )
-                except Exception as e:  # Catch broader errors during CSV processing
+                except Exception as e:
                     logger.error(
                         "Error processing CSV data for floorplan %s: %s",
                         floorplan_id,
                         str(e),
+                        exc_info=True,
                     )
             else:
                 logger.warning(

@@ -11,6 +11,9 @@ class FloorPlanAnalysisResult(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     history = HistoricalRecords()
 
+    class Meta:
+        unique_together = ("user_id", "property_id")
+
     def __str__(self):
         return f"{self.user_id} - {self.property_id}"
 
