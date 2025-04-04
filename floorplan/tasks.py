@@ -561,9 +561,21 @@ def process_structured_csv_data(rows, all_floors_data):
         floor_name = safe_string(row.get("Floor_Name"))  # Use helper
         room_id_str = row.get("Room_id")
 
-        if not floor_name:  # Handle 'unknown' or empty floor name if necessary
+        if floor_name == "unknown":
             floor_name = f"unknown_{i}"  # Or skip row? Decide policy. Assuming 'unknown' is valid.
-            # logger.warning("CSV row has missing or empty Floor_Name, using 'unknown'. Row: %s", row)
+            logger.debug(
+                "Row has 'unknown' Floor_Name, assigning unique name: '%s'. Row: %s",
+                floor_name,
+                row,  # Consider logging less verbosely
+            )
+        elif not floor_name:  # Handle empty floor name if necessary
+            floor_name = "unspecified_floor"  # Or "unknown_floor"
+            # logger.warning("CSV row has missing or empty Floor_Name. Row: %s", row)
+            logger.debug(
+                "Row has blank/None Floor_Name, assigning default: '%s'. Row: %s",
+                floor_name,
+                row,  # Consider logging less verbosely
+            )
             # continue # Or skip if floor name is essential
 
         if not room_id_str:
