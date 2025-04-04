@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from floorplan.models import (
+    AllFloorsCsvRawRow,
     AllFloorsData,
     CsvFloor,
     CsvRoom,
@@ -10,6 +11,7 @@ from floorplan.models import (
     FloorPlan,
     FloorPlanAnalysisResult,
     PlanFloor,
+    TotalAreaData,
 )
 
 
@@ -280,3 +282,63 @@ class CsvRoomScalingFactorsAdmin(admin.ModelAdmin):
 
     get_floor_name.short_description = "Floor"
     get_floor_name.admin_order_field = "room__floor__floor_name"
+
+
+@admin.register(AllFloorsCsvRawRow)
+class AllFloorsCsvRawRowAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "get_floorplan_id",  # Add helper method
+        "floor_name",
+        "room_name",
+        "room_id",
+        "is_segment",
+    )
+    list_filter = (
+        "all_floors_data__floor_plan__analysis_result__created_at",
+        "floor_name",
+    )
+    search_fields = (
+        "floor_name",
+        "room_name",
+        "all_floors_data__floor_plan__floorplan_id",
+    )
+    list_select_related = ("all_floors_data__floor_plan",)  # Optimization
+    # Make most fields readonly as they represent raw data
+    readonly_fields = [
+        f.name for f in AllFloorsCsvRawRow._meta.get_fields() if f.name != "id"
+    ]
+    list_per_page = 50
+
+    def get_floorplan_id(self, obj):
+        if obj.all_floors_data and obj.all_floors_data.floor_plan:
+            return obj.all_floors_data.floor_plan.floorplan_id
+        return None
+
+    get_floorplan_id.short_description = "Floor Plan ID"
+
+
+@admin.register(TotalAreaData)
+class TotalAreaDataAdmin(admin.ModelAdmin):
+    list_display = (
+        "area_name",
+        "get_floorplan_id",  # Method needs to access FloorPlan via AllFloorsData
+        "square_meters",
+        "square_feet",
+        "total_floors",
+        "total_named_rooms",
+    )
+    list_filter = ("all_floors_data__floor_plan__analysis_result__created_at",)
+    search_fields = (
+        "area_name",
+        "all_floors_data__floor_plan__floorplan_id",
+    )
+    list_select_related = ("all_floors_data__floor_plan",)  # Optimization
+
+    def get_floorplan_id(self, obj):
+        if obj.all_floors_data and obj.all_floors_data.floor_plan:
+            return obj.all_floors_data.floor_plan.floorplan_id
+        return None
+
+    get_floorplan_id.short_description = "Floor Plan ID"
+    get_floorplan_id.admin_order_field = "all_floors_data__floor_plan__floorplan_id"

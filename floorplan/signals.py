@@ -121,3 +121,29 @@
 #         },
 #     ],
 # }
+
+
+[
+    {
+        "floorplan_id": "fp1",
+        "original_url": "https://media.rightmove.co.uk/85k/84073/157593251/84073_1312423_FLP_00_0001.png",
+        "all_floors": {
+            "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/all_floors_json.json",
+            "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/all_floors.csv",
+            "total_area_csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/total_area.csv",
+            "image_labelme_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/side_by_side_labelme.png",
+            "notes": "",
+        },
+        "floors": [
+            {
+                "floor": "unknown",
+                "label_me_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/unknown",
+                "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/unknown/unknown.json",
+                "image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/unknown/unknown.png",
+                "labelme_image_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/unknown/unknown_labelmes.png",
+                "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/unknown/unknown.csv",
+                "image_side_by_side_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/unknown/unknown_side_by_side_labelme.png",
+            }
+        ],
+    }
+]

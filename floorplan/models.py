@@ -70,9 +70,7 @@ class PlanFloor(models.Model):
         return f"{self.floor} - {self.floor_plan.floorplan_id}"
 
 
-# === CSV Data Models (Your Original Models, Renamed) ===
-
-
+# === CSV Data Models ===
 class CsvFloor(models.Model):
     """
     Represents each row group from the CSV (identified by Floor_Name).
@@ -83,7 +81,9 @@ class CsvFloor(models.Model):
         AllFloorsData, related_name="csv_floors", on_delete=models.CASCADE
     )
     floor_name = models.CharField(max_length=100, null=True, blank=True)
+    # calculated_floor_total_sq_area_metric
     calculated_total_area_metric = models.FloatField(null=True, blank=True)
+    # calculated_floor_total_sq_area_imperial
     calculated_total_area_imperial = models.FloatField(null=True, blank=True)
     history = HistoricalRecords()
 
@@ -100,7 +100,9 @@ class CsvRoom(models.Model):
     floor = models.ForeignKey(CsvFloor, on_delete=models.CASCADE, related_name="rooms")
     room_name = models.CharField(max_length=100, null=True, blank=True)
     is_segment = models.CharField(max_length=50, null=True, blank=True)
-    room_id = models.FloatField(null=True, blank=True)
+    room_id = models.FloatField(
+        null=True, blank=True
+    )  # Used as identifier within floor
     no_of_doors = models.FloatField(null=True, blank=True)
     no_of_windows = models.FloatField(null=True, blank=True)
     no_of_room_points = models.FloatField(null=True, blank=True)
@@ -150,7 +152,7 @@ class CsvRoomDimensions(models.Model):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="dimensions"
     )
-    # Text fields for dimensions
+    # Text fields for dimensions (Handles 'Unknown')
     dimensions_imperial = models.CharField(max_length=100, null=True, blank=True)
     dimensions_metric = models.CharField(max_length=100, null=True, blank=True)
 
@@ -162,15 +164,9 @@ class CsvRoomDimensions(models.Model):
     calculated_sq_area_metric = models.FloatField(
         null=True, blank=True
     )  # Calculated Sq Area Metric
-    calculated_floor_total_sq_area_metric = models.FloatField(
-        null=True, blank=True
-    )  # Calculated Floor Total Sq Area Metric
     calculated_area_imperial = models.FloatField(
         null=True, blank=True
     )  # calculated_area_imperial
-    calculated_floor_total_sq_area_imperial = models.FloatField(
-        null=True, blank=True
-    )  # Calculated Floor Total Sq Area Imperial
     history = HistoricalRecords()
 
     def __str__(self):
@@ -199,3 +195,135 @@ class CsvRoomScalingFactors(models.Model):
             return f"Scaling Factors for {room_name}"
         except CsvRoom.DoesNotExist:
             return f"Scaling Factors for Detached Room (ID: {self.id})"
+
+
+class AllFloorsCsvRawRow(models.Model):
+    """Stores a raw representation of a single row from all_floors.csv."""
+
+    # Link back to the AllFloorsData instance this row belongs to
+    all_floors_data = models.ForeignKey(
+        AllFloorsData, on_delete=models.CASCADE, related_name="all_floors_raw_rows"
+    )
+
+    # --- Fields matching CSV columns ---
+    # Object/String Columns
+    floor_name = models.CharField(
+        max_length=100, null=True, blank=True, db_index=True
+    )  # Index useful for potential lookups
+    room_name = models.CharField(max_length=100, null=True, blank=True)
+    is_segment = models.CharField(max_length=50, null=True, blank=True)
+    dimensions_imperial = models.CharField(max_length=100, null=True, blank=True)
+    dimensions_metric = models.CharField(max_length=100, null=True, blank=True)
+
+    # Float64/Numeric Columns
+    room_id = models.FloatField(null=True, blank=True, db_index=True)  # Index useful
+    no_of_door = models.FloatField(null=True, blank=True)  # Match CSV header case
+    no_of_window = models.FloatField(null=True, blank=True)  # Match CSV header case
+    no_of_room_points = models.FloatField(null=True, blank=True)
+    min_x_pixels = models.FloatField(
+        null=True, blank=True, db_column="min_x_pixels_csv"
+    )  # Use db_column if name conflicts/desired
+    min_y_pixels = models.FloatField(
+        null=True, blank=True, db_column="min_y_pixels_csv"
+    )
+    max_x_pixels = models.FloatField(
+        null=True, blank=True, db_column="max_x_pixels_csv"
+    )
+    max_y_pixels = models.FloatField(
+        null=True, blank=True, db_column="max_y_pixels_csv"
+    )
+    max_area_metric = models.FloatField(
+        null=True, blank=True, db_column="max_area_metric_csv"
+    )
+    max_area_imperial = models.FloatField(
+        null=True, blank=True, db_column="max_area_imperial_csv"
+    )
+    max_area_pixels = models.FloatField(
+        null=True, blank=True, db_column="max_area_pixels_csv"
+    )
+    actual_area_pixels = models.FloatField(
+        null=True, blank=True, db_column="actual_area_pixels_csv"
+    )
+    pixel_ratio = models.FloatField(null=True, blank=True, db_column="pixel_ratio_csv")
+    scale_metric = models.FloatField(
+        null=True, blank=True, db_column="scale_metric_csv"
+    )
+    scale_imperial = models.FloatField(
+        null=True, blank=True, db_column="scale_imperial_csv"
+    )
+    calculated_sq_area_metric = models.FloatField(
+        null=True, blank=True, db_column="calculated_sq_area_metric_csv"
+    )
+    calculated_floor_total_sq_area_metric = models.FloatField(
+        null=True, blank=True, db_column="calc_floor_total_metric_csv"
+    )
+    calculated_area_imperial = models.FloatField(
+        null=True, blank=True, db_column="calculated_area_imperial_csv"
+    )  # Note lowercase 'c'
+    calculated_floor_total_sq_area_imperial = models.FloatField(
+        null=True, blank=True, db_column="calc_floor_total_imperial_csv"
+    )
+
+    history = HistoricalRecords()
+
+    class Meta:
+        verbose_name = "All Floors CSV Raw Row"
+        verbose_name_plural = "All Floors CSV Raw Rows"
+
+        # Add indexes for frequently filtered columns if needed (like floor_name, room_id)
+        indexes = [
+            models.Index(fields=["all_floors_data", "floor_name"]),
+            models.Index(fields=["all_floors_data", "room_id"]),
+        ]
+
+    def __str__(self):
+        afd_id = self.all_floors_data_id if self.all_floors_data_id else "N/A"
+        return (
+            f"Raw Row for AFD:{afd_id} - Floor:{self.floor_name} RoomID:{self.room_id}"
+        )
+
+
+class TotalAreaData(models.Model):
+    """Stores parsed data from the total_area.csv file."""
+
+    # Link back to the AllFloorsData it belongs to
+    all_floors_data = models.ForeignKey(
+        AllFloorsData, related_name="total_area_data", on_delete=models.CASCADE
+    )
+    # Fields corresponding to total_area.csv columns
+    area_name = models.CharField(
+        max_length=500, null=True, blank=True
+    )  # Increased length for descriptive names
+    square_meters = models.FloatField(null=True, blank=True)
+    square_feet = models.FloatField(null=True, blank=True)
+    total_floors = models.IntegerField(null=True, blank=True)  # Assuming integer
+    total_named_rooms = models.IntegerField(null=True, blank=True)
+    total_segments = models.IntegerField(null=True, blank=True)
+    total_points = models.IntegerField(null=True, blank=True)
+    total_objects = models.IntegerField(null=True, blank=True)
+    total_door_objects = models.IntegerField(null=True, blank=True)
+    total_window_objects = models.IntegerField(null=True, blank=True)
+    total_stair_objects = models.IntegerField(null=True, blank=True)
+    list_of_objects = models.TextField(
+        null=True, blank=True
+    )  # Store the list representation as text
+    total_actual_pixels = models.FloatField(null=True, blank=True)
+    metric_scale = models.FloatField(null=True, blank=True)
+    imperial_scale = models.FloatField(null=True, blank=True)
+    input_image_tokens = models.IntegerField(null=True, blank=True)
+    input_text_tokens = models.IntegerField(null=True, blank=True)
+    output_text_tokens = models.IntegerField(null=True, blank=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        # If you only expect one row per Area Name per AllFloorsData, enforce it
+        unique_together = ("all_floors_data", "area_name")
+        verbose_name_plural = "Total Area Data"  # Nicer name in admin
+
+    def __str__(self):
+        return f"{self.area_name} for {self.all_floors_data.floor_plan.floorplan_id}"
+
+
+# csv has been renamed to all_floors.csv
+# save metabase sql for the report writing so that
