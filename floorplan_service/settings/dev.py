@@ -74,3 +74,15 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 # ================================ CELERY =======================================
+
+
+# ================================ REDIS =======================================
+REDIS_HOST = "redis"
+REDIS_PORT = 6379
+# Choose a database number for this specific temporary storage
+# Avoid using DB 0 if your main cache or Celery broker uses it
+REDIS_DB_TEMP_FLOORPLANS = 1
+# Time-to-live for the stored original floorplan data (e.g., 1 day = 86400 seconds)
+# Adjust based on how long your analysis task might reasonably take + buffer
+REDIS_TEMP_FLOORPLANS_TTL = 86400
+# ================================ REDIS =======================================

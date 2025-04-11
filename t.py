@@ -1,53 +1,43 @@
-from django.db.models import Count
-
 from floorplan.models import FloorPlan
 
-print("--- Finding FloorPlan duplicates based on floorplan_id ---")
+# 3. List the PKs with missing URLs
+missing_url_pks = [168, 169, 170, 171, 172, 196]
 
-duplicates = (
-    FloorPlan.objects.values("floorplan_id")
-    .annotate(count=Count("id"))
-    .filter(count__gt=1)
-)
+# 4. Loop and update
+updated_count = 0
+not_found_count = 0
+print(f"Attempting to update original_url for {len(missing_url_pks)} records...")
 
-if not duplicates:
-    print("No duplicate floorplan_id values found in FloorPlan table.")
-else:
-    print(f"Found {duplicates.count()} floorplan_id values with duplicates.")
-    for item in duplicates:
-        fp_id = item["floorplan_id"]
-        count = item["count"]
-        print(
-            f"\nFound {count} records for floorplan_id '{fp_id}'. Preparing to delete extras..."
-        )
+for pk in missing_url_pks:
+    try:
+        fp = FloorPlan.objects.get(pk=pk)
+        # Generate the fake URL using the pattern
+        fake_url = f"https://fake-placeholder.com/floorplan/{pk}"
+        fp.original_url = fake_url
+        fp.save(update_fields=["original_url"])  # Only update this field
+        print(f"  Updated pk={pk} with URL: {fake_url}")
+        updated_count += 1
+    except FloorPlan.DoesNotExist:
+        print(f"  Record pk={pk} not found.")
+        not_found_count += 1
+    except Exception as e:
+        print(f"  Error updating pk={pk}: {e}")
 
-        # Get all records for this floorplan_id, order by creation time of the *analysis result*
-        # or the floorplan's own ID as a fallback. Keep the ONE associated with the
-        # EARLIEST analysis result (or adjust ordering as needed).
-        results_to_check = FloorPlan.objects.filter(floorplan_id=fp_id).order_by(
-            "analysis_result__created_at", "id"
-        )  # Or '-analysis_result__created_at' to keep newest
+print(f"\nFinished updating URLs.")
+print(f"Successfully updated: {updated_count}")
+print(f"Not found: {not_found_count}")
 
-        # Keep the first one, get IDs of the rest to delete
-        ids_to_delete = list(results_to_check.values_list("id", flat=True)[1:])
 
-        if ids_to_delete:
-            record_to_keep = results_to_check.first()
-            print(
-                f"  Keeping FloorPlan ID: {record_to_keep.id} (AnalysisResult ID: {record_to_keep.analysis_result_id}, Created: {record_to_keep.analysis_result.created_at})"
-            )
-            print(f"  Planning to Delete FloorPlan IDs: {ids_to_delete}")
-            # *** UNCOMMENT THE NEXT LINE TO ACTUALLY DELETE ***
-            FloorPlan.objects.filter(id__in=ids_to_delete).delete()
-            print(
-                f"  ---> Deletion SKIPPED (uncomment the delete line to proceed)"
-            )  # Safety message
-        else:
-            print(
-                f"  No extra records found to delete for floorplan_id '{fp_id}', count was {count}. Check manually."
-            )
-
-print("\n--- FloorPlan duplicate cleanup check finished ---")
-print(
-    "Review the output. If correct, BACKUP YOUR DB, then re-run the loop but UNCOMMENT the delete line."
-)
+# --- ALSO DELETE THE TRULY REDUNDANT RECORD ---
+# As identified before, one of 199 or 201 needs deletion.
+# Let's delete 201.
+pk_to_delete = 201
+try:
+    print(f"\nAttempting to delete truly redundant record pk={pk_to_delete}...")
+    fp_to_delete = FloorPlan.objects.get(pk=pk_to_delete)
+    deleted_info = fp_to_delete.delete()
+    print(f"Successfully deleted pk={pk_to_delete}. Info: {deleted_info}")
+except FloorPlan.DoesNotExist:
+    print(f"Record pk={pk_to_delete} already deleted or not found.")
+except Exception as e:
+    print(f"Error deleting pk={pk_to_delete}: {e}")

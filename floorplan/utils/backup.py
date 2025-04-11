@@ -37,8 +37,8 @@ def backup_floorplan(instance):
                 "notes": all_floors.notes,
                 # Initialize lists for nested structures
                 "backup_csv_floors": [],
-                "backup_all_floors_raw_rows": [],  # <-- Initialize raw rows list
-                "backup_total_area_data": [],  # <-- Initialize total area list (if backing up)
+                "backup_all_floors_csv_data": [],  # <-- Initialize raw rows list
+                "backup_total_areas_csv_data": [],  # <-- Initialize total area list (if backing up)
             }
 
             # Process Structured CSV floors (CsvFloor, CsvRoom, etc.)
@@ -95,10 +95,10 @@ def backup_floorplan(instance):
             all_floors_payload["backup_csv_floors"] = csv_floors_list
             payload["backup_all_floors_data"] = all_floors_payload
 
-            # --- Process Raw Row Data (AllFloorsCsvRawRow) ---
+            # --- Process Raw Row Data (AllFloorsCsvData) ---
             raw_rows_list = []
             # Efficiently serialize using model_to_dict or values()
-            raw_row_queryset = all_floors.all_floors_raw_rows.all().order_by(
+            raw_row_queryset = all_floors.all_floors_csv_data.all().order_by(
                 "id"
             )  # Order for consistency
             for raw_row in raw_row_queryset:
@@ -107,21 +107,21 @@ def backup_floorplan(instance):
                 # Could add the parent ID explicitly if needed
                 # raw_row_dict['all_floors_data_id'] = raw_row.all_floors_data_id
                 raw_rows_list.append(raw_row_dict)
-            all_floors_payload["backup_all_floors_raw_rows"] = raw_rows_list
+            all_floors_payload["backup_all_floors_csv_data"] = raw_rows_list
             logger.debug("Serialized %d raw CSV rows.", len(raw_rows_list))
             # --- END Raw Row Data ---
 
-            # --- Process Total Area Data (TotalAreaData) --- Optional, include if needed
+            # --- Process Total Area Data (TotalAreasCsvData) --- Optional, include if needed
             logger.debug("Serializing total area data for backup...")
             total_area_list = []
-            total_area_queryset = all_floors.total_area_data.all().order_by(
+            total_area_queryset = all_floors.total_areas_csv_data.all().order_by(
                 "id"
             )  # Order for consistency
             for ta_data in total_area_queryset:
                 # Exclude the foreign key object
                 ta_data_dict = model_to_dict(ta_data, exclude=["all_floors_data"])
                 total_area_list.append(ta_data_dict)
-            all_floors_payload["backup_total_area_data"] = total_area_list
+            all_floors_payload["backup_total_areas_csv_data"] = total_area_list
             logger.debug("Serialized %d total area data rows.", len(total_area_list))
             # --- END Total Area Data ---
 

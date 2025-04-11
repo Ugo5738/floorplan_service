@@ -1,11 +1,17 @@
 # floorplan/tasks.py
-import csv
-import io
 
+import csv
+import hashlib  # For URL hashing
+import io
+import json
+import uuid
+
+import redis
 import requests
 from celery import shared_task
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from floorplan.models import (
     AllFloorsCsvRawRow,
@@ -26,884 +32,1175 @@ from floorplan_service.config.logging_config import configure_logger
 logger = configure_logger(__name__)
 
 
-# Define values to treat as null/invalid for float conversion
-INVALID_FLOAT_VALUES = [None, "", "nan", "unknown"]
-# Define values to treat as null/invalid for dimension strings
-INVALID_DIMENSION_VALUES = [None, "", "unknown"]
-INVALID_INT_VALUES = [None, "", "nan", "unknown"]
-INVALID_STRING_VALUES = [None]
+# === Helper Constants ===
+INVALID_FLOAT_VALUES = frozenset([None, "", "nan", "unknown", "Unknown"])
+INVALID_DIMENSION_VALUES = frozenset([None, "", "unknown", "Unknown"])
+INVALID_INT_VALUES = frozenset([None, "", "nan", "unknown", "Unknown"])
+INVALID_STRING_VALUES = frozenset([None])  # Only None is truly invalid for strings
+
+# === Helper Functions ===
 
 
-# Helper to safely convert to float or return None
-def safe_float(row, key):
-    val = row.get(key)
-    return float(val) if val not in INVALID_FLOAT_VALUES else None
-
-
-def safe_dimension(row, key):
-    val = row.get(key)
-    # Check against None, '', and 'unknown' (case-insensitive)
-    return (
-        val
-        if val not in INVALID_DIMENSION_VALUES and val.lower() != "unknown"
-        else None
-    )
-
-
-def safe_int(val):
-    """
-    Safely attempts to convert a value to an integer.
-    Handles None, empty strings, 'nan', 'unknown'.
-    Also handles float strings like '5.0'.
-    Returns None if conversion is not possible or value is invalid.
-    """
-    if val in INVALID_INT_VALUES:
+def safe_float(value):
+    """Safely converts a value to float, returning None for invalid inputs."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value in INVALID_FLOAT_VALUES:
         return None
     try:
-        # Convert to float first to handle strings like '5.0', then to int
-        return int(float(val))
+        return float(value)
     except (ValueError, TypeError):
-        # Catches errors if val is not convertible to float (e.g., 'abc')
-        # or if val is None/incompatible type for float()
         return None
 
 
-def safe_string(val):
-    # Return None if val is None, otherwise return the string value
-    # This prevents storing Python None as string "None"
-    return val if val not in INVALID_STRING_VALUES else None
+def safe_int(value):
+    """
+    Safely attempts to convert a value to an integer.
+    Handles None, empty strings, 'nan', 'unknown', and float strings like '5.0'.
+    Returns None if conversion is not possible or value is invalid.
+    """
+    if isinstance(value, str):
+        value = value.strip()
+    if value in INVALID_INT_VALUES:
+        return None
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def safe_dimension(value):
+    """Returns the value if it's a valid dimension string, else None."""
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower() in INVALID_DIMENSION_VALUES:
+            return None
+    elif value in INVALID_DIMENSION_VALUES:
+        return None
+    return value
+
+
+def safe_string(value):
+    """Returns the stripped string value, or None if the input is None or results in empty string."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None  # Treat empty string as None
+    return value if value not in INVALID_STRING_VALUES else None
+
+
+# === Celery Tasks ===
+def get_redis_connection():
+    try:
+        # Basic redis-py connection pool
+        pool = redis.ConnectionPool(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB_TEMP_FLOORPLANS,
+            decode_responses=True,  # Decode responses to strings
+        )
+        return redis.Redis(connection_pool=pool)
+        # OR if using django-redis cache backend named 'temp_floorplans':
+        # from django.core.cache import caches
+        # return caches['temp_floorplans'].client.get_client()
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis for temp floorplan storage: {e}")
+        return None
 
 
 @shared_task(bind=True)
 def process_floorplan_analysis(self, user_id, property_id, floorplans):
     """
     Task to initiate the analysis process via the analyzer API.
-    In the new workflow, this only starts the process;
-    the detailed results will be sent later via the webhook.
     """
     logger.info(
         "Starting floorplan analysis task for user_id=%s, property_id=%s",
         user_id,
         property_id,
     )
+    # webhook_url = settings.FLOORPLAN_WEBHOOK_URL
+    webhook_url = "https://9687-41-76-192-17.ngrok-free.app/api/floorplan/webhook/"
+    analyzer_url = settings.FLOORPLAN_ANALYZER_URL
+
+    if not webhook_url or not analyzer_url:
+        logger.error(
+            "Missing FLOORPLAN_WEBHOOK_URL or FLOORPLAN_ANALYZER_URL in settings."
+        )
+        return {"error": "Server configuration error: Missing required URLs."}
+
+    # --- Store original data in Redis ---
+    redis_conn = get_redis_connection()
+    redis_key = f"original_floorplans:{user_id}:{property_id}"
+    stored_successfully = False
+    if redis_conn:
+        try:
+            # Store the floorplans dict as a JSON string
+            redis_conn.set(
+                redis_key, json.dumps(floorplans), ex=settings.REDIS_TEMP_FLOORPLANS_TTL
+            )
+            logger.info(
+                "Successfully stored original floorplan data in Redis for key: %s",
+                redis_key,
+            )
+            stored_successfully = True
+        except Exception as e:
+            logger.error(
+                "Failed to store original floorplan data in Redis for key %s: %s",
+                redis_key,
+                e,
+            )
+            # Decide if failure to store should prevent calling the API
+            # For now, we'll log the error and continue, but the fallback won't work.
+    else:
+        logger.error(
+            "Could not get Redis connection. Fallback URL logic will not work."
+        )
+    # --- End Redis storage ---
+
     payload = {
-        "webhook_url": settings.FLOORPLAN_WEBHOOK_URL,
+        "webhook_url": webhook_url,
         "user_id": user_id,
         "property_id": property_id,
         "floorplans": floorplans,
     }
-    analyzer_url = settings.FLOORPLAN_ANALYZER_URL
+
     try:
-        logger.info("Analyzer payload being sent: %s", payload)
-        logger.info("Calling analyzer API at %s", analyzer_url)
-        response = requests.post(analyzer_url, json=payload)
-        response.raise_for_status()
-        logger.info("Analyzer API initiated analysis successfully")
-    except requests.RequestException as e:
-        logger.error("Failed to call analyzer API: %s", str(e))
-        # Celery retry or marking failure
-        raise self.retry(exc=e, countdown=60)
-    except AttributeError:
-        logger.error(
-            "Missing FLOORPLAN_WEBHOOK_URL or FLOORPLAN_ANALYZER_URL in settings."
+        logger.info(
+            "Calling analyzer API at %s with payload: %s", analyzer_url, payload
         )
-        # Handle missing settings appropriately, maybe return error or raise specific exception
-        return {"error": "Server configuration error: Missing required URLs."}
+        response = requests.post(analyzer_url, json=payload, timeout=60)  # Add timeout
+        response.raise_for_status()
+        logger.info("Analyzer API call successful, analysis initiated.")
+    except requests.Timeout:
+        logger.error("Timeout calling analyzer API at %s", analyzer_url)
+        raise self.retry(countdown=60, max_retries=5)
+    except requests.RequestException as e:
+        status_code = getattr(e.response, "status_code", "N/A")
+        response_text = getattr(e.response, "text", "N/A")
+        logger.error(
+            "Failed to call analyzer API: %s (Status: %s). Response: %s",
+            str(e),
+            status_code,
+            response_text,
+        )
+        if (
+            redis_conn
+            and stored_successfully
+            and status_code not in [500, 502, 503, 504]
+        ):  # Don't delete on potentially temporary server errors
+            try:
+                redis_conn.delete(redis_key)
+                logger.info(
+                    "Deleted temporary Redis key %s due to definitive API call failure.",
+                    redis_key,
+                )
+            except Exception as del_e:
+                logger.error(
+                    "Failed to delete Redis key %s after API failure: %s",
+                    redis_key,
+                    del_e,
+                )
+        raise self.retry(exc=e, countdown=60, max_retries=5)
+    except Exception as e:
+        logger.exception(
+            "Unexpected error during analyzer API call preparation/execution: %s", e
+        )
+        raise self.retry(exc=e, countdown=120, max_retries=3)
 
     logger.info(
-        "Floorplan analysis initiation recorded for user_id=%s, property_id=%s",
+        "Floorplan analysis initiation task completed for user_id=%s, property_id=%s",
         user_id,
         property_id,
     )
-    return {"message": "Analysis initiated"}
+    return {"message": "Analysis initiated successfully"}
 
 
 @shared_task(bind=True)
 @transaction.atomic
 def process_floorplan_webhook(self, analysis_data):
     """
-    Processes the analysis payload sent to the webhook.
-
-    For creation:
-      - Expects: task="creation", message, user_id, property_id,
-        and output_data as a list of new floorplans.
-
-    For update:
-      - Expects: task="update", user_id, property_id,
-        and output_data as an object containing the full data for the
-        updated floorplan (similar structure to a single item in creation).
-
-    Both tasks now use `update_or_create` where applicable to handle
-    data consistently.
+    Processes the analysis payload sent to the webhook (entry point).
+    Delegates processing based on the task type ('creation' or 'update').
     """
-    task_type = analysis_data.get("task", "creation")
+    task_type = analysis_data.get("task")
     user_id = analysis_data.get("user_id")
     property_id = analysis_data.get("property_id")
-    output_data = analysis_data.get("output_data")
+    output_data = analysis_data.get("output_data")  # Extract output_data
 
-    if not user_id or not property_id or not output_data:
-        logger.error("Webhook received incomplete data: %s", analysis_data)
+    # --- Retrieve original data from Redis ---
+    original_request_floorplans = None
+    redis_conn = get_redis_connection()
+    redis_key = f"original_floorplans:{user_id}:{property_id}"
+    if redis_conn:
+        try:
+            stored_data = redis_conn.get(redis_key)
+            if stored_data:
+                original_request_floorplans = json.loads(stored_data)  # Deserialize
+                logger.info(
+                    "Successfully retrieved original floorplan data from Redis for key: %s",
+                    redis_key,
+                )
+                # Optional: Delete key after retrieval if it's single-use
+                # redis_conn.delete(redis_key)
+            else:
+                logger.warning(
+                    "No original floorplan data found in Redis for key: %s (expired or not stored?)",
+                    redis_key,
+                )
+        except json.JSONDecodeError:
+            logger.error("Failed to decode JSON data from Redis key: %s", redis_key)
+        except Exception as e:
+            logger.error(
+                "Failed to retrieve/decode data from Redis for key %s: %s", redis_key, e
+            )
+    else:
+        logger.warning(
+            "Could not get Redis connection. Fallback URL logic will not work."
+        )
+    # --- End Redis retrieval ---
+
+    # 1. Check base required fields (excluding output_data for now)
+    base_required = {"task": task_type, "user_id": user_id, "property_id": property_id}
+    missing_base = [k for k, v in base_required.items() if not v]
+    if missing_base:
+        logger.error(
+            "Webhook received incomplete base data. Missing: %s. Payload: %s",
+            missing_base,
+            analysis_data,
+        )
         return {
-            "error": "Missing user_id, property_id, or output_data in webhook payload."
+            "error": f"Missing required base fields in webhook payload: {missing_base}"
         }
 
-    if task_type == "creation":
-        message = analysis_data.get("message", "No message provided")
-        # Ensure output_data is a list for creation
-        if not isinstance(output_data, list):
-            logger.error(
-                "Webhook creation task expected list for output_data, got %s",
-                type(output_data),
-            )
-            return {"error": "Invalid output_data format for creation task."}
+    # 2. Check if output_data exists and is a list (handle non-list types)
+    if output_data is None:
+        missing_fields = ["output_data"]  # Explicitly state it's missing
+        logger.error(
+            "Webhook received incomplete data. Missing: %s. Payload: %s",
+            missing_fields,
+            analysis_data,
+        )
+        return {
+            "error": f"Missing required fields in webhook payload: {missing_fields}"
+        }
 
+    if not isinstance(output_data, list):
+        logger.error(
+            "Webhook received invalid type for output_data: %s. Expected list. Payload: %s",
+            type(output_data).__name__,
+            analysis_data,
+        )
+        return {
+            "error": f"Invalid output_data type in webhook payload: expected list, got {type(output_data).__name__}"
+        }
+
+    # 3. Handle the case where output_data is an EMPTY list
+    if not output_data:  # Specifically checks if the list is empty
+        logger.warning(
+            "Webhook received empty output_data list for user %s, property %s. Assuming no floorplans were processed or returned by extractor. Payload: %s",
+            user_id,
+            property_id,
+            analysis_data,
+        )
+        # Optionally: Still record that the analysis attempt happened
         try:
-            # Create a single AnalysisResult for this creation batch
             analysis_result, created = FloorPlanAnalysisResult.objects.update_or_create(
                 user_id=user_id,
                 property_id=property_id,
-                # Use a unique identifier if possible, or rely on get_or_create with user/property
-                defaults={"message": message},
+                defaults={
+                    "message": analysis_data.get(
+                        "message", "Extractor returned no floorplan data"
+                    )
+                },
             )
             action = "Created" if created else "Updated"
             logger.info(
-                "%s FloorPlanAnalysisResult (ID: %s) for user %s, property %s.",
+                "%s FloorPlanAnalysisResult (ID: %s) for user %s, property %s, received empty output_data.",
                 action,
                 analysis_result.id,
                 user_id,
                 property_id,
             )
-        except Exception as e:
-            # Catch potential errors during the update_or_create itself
+        except Exception as db_exc:
             logger.error(
-                "Error during update_or_create for FloorPlanAnalysisResult (user: %s, property: %s): %s",
+                "Error updating FloorPlanAnalysisResult for empty webhook data (user %s, property %s): %s",
                 user_id,
                 property_id,
-                str(e),
-                exc_info=True,
+                db_exc,
             )
-            return {"error": "Failed to process analysis result header."}
-        # --- End update_or_create block ---
-
-        logger.info("Processing output data: %s", output_data)
-
-        for item in output_data:
-            floorplan_id = item.get("floorplan_id")
-            original_url = item.get("original_url")
-            all_floors_item = item.get("all_floors")
-            floors_list = item.get("floors", [])
-
-            if not floorplan_id or not original_url or not all_floors_item:
-                logger.warning(
-                    "Skipping item in creation due to missing data: %s", item
-                )
-                continue
-
-            logger.info("Processing floorplan (creation) with id=%s", floorplan_id)
-
-            # Create or update FloorPlan (useful if somehow retried)
-            floorplan, fp_created = FloorPlan.objects.update_or_create(
-                analysis_result=analysis_result,
-                floorplan_id=floorplan_id,
-                defaults={
-                    "original_url": original_url,
-                },
-            )
-            action_fp = "Created" if fp_created else "Updated"
-            logger.info("%s FloorPlan with id=%s", action_fp, floorplan_id)
-
-            # Create or update AllFloorsData
-            all_floors_data, afd_created = AllFloorsData.objects.update_or_create(
-                floor_plan=floorplan,
-                defaults={
-                    "json_file_url": all_floors_item.get("json_file_url"),
-                    "csv_url": all_floors_item.get("csv_url"),
-                    "total_area_csv_url": all_floors_item.get("total_area_csv_url"),
-                    "image_labelme_side_by_side_url": all_floors_item.get(
-                        "image_labelme_side_by_side_url"
-                    ),
-                    "notes": all_floors_item.get("notes", ""),
-                },
-            )
-            action_afd = "Created" if afd_created else "Updated"
-            logger.info(
-                "%s AllFloorsData for floorplan_id=%s",
-                action_afd,
-                floorplan.floorplan_id,
-            )
-
-            # Process PlanFloors
-            existing_plan_floor_names = set(
-                floorplan.plan_floors.values_list("floor", flat=True)
-            )
-            current_plan_floor_names = set()
-            for floor_data in floors_list:
-                floor_name = floor_data.get("floor")
-                if not floor_name:
-                    logger.warning(
-                        "Skipping plan floor item due to missing floor name: %s",
-                        floor_data,
-                    )
-                    continue
-                current_plan_floor_names.add(floor_name)
-                pf, pf_created = PlanFloor.objects.update_or_create(
-                    floor_plan=floorplan,
-                    floor=floor_name,  # Assumes (floor_plan, floor) is unique
-                    defaults={
-                        "label_me_url": floor_data.get("label_me_url"),
-                        "json_file_url": floor_data.get("json_file_url"),
-                        "image_url": floor_data.get("image_url"),
-                        "labelme_image_url": floor_data.get("labelme_image_url"),
-                        "csv_url": floor_data.get(
-                            "csv_url"
-                        ),  # Might be floor-specific CSV
-                        "image_side_by_side_url": floor_data.get(
-                            "image_side_by_side_url"
-                        ),
-                    },
-                )
-                action_pf = "Created" if pf_created else "Updated"
-                logger.info("%s PlanFloor for floor=%s", action_pf, floor_name)
-
-            # Optional: Remove PlanFloors that are no longer present in the data
-            floors_to_remove = existing_plan_floor_names - current_plan_floor_names
-            if floors_to_remove:
-                logger.info(
-                    "Removing old PlanFloors not in new data: %s", floors_to_remove
-                )
-                floorplan.plan_floors.filter(floor__in=floors_to_remove).delete()
-
-            # Process the main CSV data
-            csv_url = all_floors_data.csv_url
-            if csv_url:
-                try:
-                    logger.info("Downloading CSV data from %s", csv_url)
-                    csv_response = requests.get(csv_url)
-                    csv_response.raise_for_status()
-                    csv_content = csv_response.text
-                    csv_file = io.StringIO(csv_content)
-                    reader = csv.DictReader(csv_file)
-                    # Use the consolidated processing function
-                    process_csv_data(reader, all_floors_data)
-                    logger.info(
-                        "CSV data processed successfully for floorplan_id=%s",
-                        floorplan.floorplan_id,
-                    )
-                except requests.RequestException as e:
-                    logger.error(
-                        "Failed to download or process CSV from %s: %s", csv_url, str(e)
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Error processing CSV data for floorplan %s: %s",
-                        floorplan_id,
-                        str(e),
-                        exc_info=True,
-                    )
-            else:
-                logger.warning(
-                    "No main CSV URL provided for floorplan_id=%s", floorplan_id
-                )
-
-            # --- Process total_area.csv ---
-            total_area_csv_url = all_floors_data.total_area_csv_url
-            processed_area_names = set()
-            if total_area_csv_url:
-                try:
-                    logger.info(
-                        "Downloading total_area.csv data from %s", total_area_csv_url
-                    )
-                    total_area_response = requests.get(total_area_csv_url, timeout=30)
-                    total_area_response.raise_for_status()
-                    total_area_content = total_area_response.text
-                    total_area_reader = csv.DictReader(io.StringIO(total_area_content))
-
-                    for row in total_area_reader:
-                        area_name = row.get("Area Name")
-                        if not area_name:
-                            logger.warning(
-                                "Skipping total_area.csv row due to missing Area Name: %s",
-                                row,
-                            )
-                            continue
-                        processed_area_names.add(area_name)
-
-                        ta_data, ta_created = TotalAreaData.objects.update_or_create(
-                            all_floors_data=all_floors_data,
-                            area_name=area_name,
-                            defaults={  # Map all columns from CSV to model fields
-                                "square_meters": safe_float(
-                                    row, row.get("Square Meters")
-                                ),
-                                "square_feet": safe_float(row, row.get("Square Feet")),
-                                "total_floors": safe_int(row.get("Total Floors")),
-                                "total_named_rooms": safe_int(
-                                    row.get("Total Named Rooms")
-                                ),
-                                "total_segments": safe_int(row.get("Total Segments")),
-                                "total_points": safe_int(row.get("Total Points")),
-                                "total_objects": safe_int(row.get("Total Objects")),
-                                "total_door_objects": safe_int(
-                                    row.get("Total Door Objects")
-                                ),
-                                "total_window_objects": safe_int(
-                                    row.get("Total Window Objects")
-                                ),
-                                "total_stair_objects": safe_int(
-                                    row.get("Total Stair Objects")
-                                ),
-                                "list_of_objects": row.get(
-                                    "List of Objects"
-                                ),  # Store raw string/list representation
-                                "total_pixels": safe_float(
-                                    row, row.get("Total Pixels")
-                                ),
-                                "metric_scale": safe_float(
-                                    row, row.get("Metric Scale")
-                                ),
-                                "imperial_scale": safe_float(
-                                    row, row.get("Imperial Scale")
-                                ),
-                                "input_image_tokens": safe_int(
-                                    row.get("Input Image Tokens")
-                                ),
-                                "input_text_tokens": safe_int(
-                                    row.get("Input Text Tokens")
-                                ),
-                                "output_text_tokens": safe_int(
-                                    row.get("Output Text Tokens")
-                                ),
-                            },
-                        )
-                        action_ta = "Created" if ta_created else "Updated"
-                        logger.info(
-                            "%s TotalAreaData for Area Name: %s", action_ta, area_name
-                        )
-
-                    # Delete stale TotalAreaData rows
-                    stale_total_area_data = all_floors_data.total_area_data.exclude(
-                        area_name__in=processed_area_names
-                    )
-                    if stale_total_area_data.exists():
-                        logger.info(
-                            "Deleting stale TotalAreaData rows: %s",
-                            list(
-                                stale_total_area_data.values_list(
-                                    "area_name", flat=True
-                                )
-                            ),
-                        )
-                        stale_total_area_data.delete()
-
-                except requests.RequestException as e:
-                    logger.error(
-                        "Failed to download total_area.csv from %s: %s",
-                        total_area_csv_url,
-                        str(e),
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Error processing total_area.csv for floorplan %s: %s",
-                        floorplan_id,
-                        str(e),
-                        exc_info=True,
-                    )
-            else:
-                logger.warning(
-                    "No total_area.csv URL provided for floorplan_id=%s", floorplan_id
-                )
-                # Delete any existing TotalAreaData if the URL is now missing/null
-                if all_floors_data.total_area_data.exists():
-                    logger.info(
-                        "Deleting existing TotalAreaData as total_area_csv_url is now missing."
-                    )
-                    all_floors_data.total_area_data.all().delete()
-
-            # Backup the processed floorplan state
+        if redis_conn and stored_data:  # Check if we had data to delete
             try:
-                logger.info("Backing up floorplan with id=%s", floorplan.floorplan_id)
-                backup_floorplan(floorplan)
+                redis_conn.delete(redis_key)
                 logger.info(
-                    "Backup completed for floorplan_id=%s", floorplan.floorplan_id
+                    "Deleted Redis key %s after processing empty webhook.", redis_key
                 )
-            except Exception as e:
+            except Exception as del_e:
                 logger.error(
-                    "Error backing up floorplan %s: %s", floorplan.floorplan_id, str(e)
+                    "Failed to delete Redis key %s after empty webhook: %s",
+                    redis_key,
+                    del_e,
                 )
-
-        logger.info(
-            "Floorplan creation webhook processing completed for analysis_result id=%s",
-            analysis_result.id,
-        )
         return {
-            "message": "Webhook creation processing completed",
-            "analysis_id": analysis_result.id,
+            "message": "Webhook processed successfully, but output_data list was empty."
         }
 
-    elif task_type == "update":
-        # Assume output_data is a dictionary representing the full updated floorplan
-        if not isinstance(output_data, dict):
-            logger.error(
-                "Webhook update task expected dict for output_data, got %s",
-                type(output_data),
-            )
-            return {"error": "Invalid output_data format for update task."}
+    logger.info(
+        "Processing webhook task '%s' for user '%s', property '%s' with %d item(s) in output_data",
+        task_type,
+        user_id,
+        property_id,
+        len(output_data),  # Now safe to use len()
+    )
 
-        floorplan_id = output_data.get("floorplan_id")
-        original_url = output_data.get("original_url")  # Get original URL if provided
-        all_floors_item = output_data.get("all_floors")
-        floors_list = output_data.get("floors", [])
-
-        if not floorplan_id or not all_floors_item:
-            logger.error(
-                "Missing floorplan_id or all_floors data in update payload: %s",
-                output_data,
-            )
-            return {
-                "error": "Missing floorplan_id or all_floors data in update payload"
-            }
-
-        try:
-            # Find the existing FloorPlan
-            floorplan = FloorPlan.objects.select_related("analysis_result").get(
-                floorplan_id=floorplan_id
-            )
-            # Optionally update original_url if provided in the update
-            if original_url and floorplan.original_url != original_url:
-                floorplan.original_url = original_url
-                floorplan.save(update_fields=["original_url"])
-                logger.info("Updated original_url for FloorPlan %s", floorplan_id)
-
-        except FloorPlan.DoesNotExist:
-            logger.error("FloorPlan with id %s does not exist for update", floorplan_id)
-            return {
-                "error": f"FloorPlan with id {floorplan_id} does not exist for update"
-            }
-        except Exception as e:
-            logger.error(
-                "Error retrieving FloorPlan %s for update: %s",
-                floorplan_id,
-                str(e),
-                exc_info=True,
-            )
-            return {"error": f"Could not retrieve FloorPlan {floorplan_id} for update"}
-
-        logger.info("Processing update for FloorPlan id=%s", floorplan_id)
-
-        # Update or Create AllFloorsData
-        all_floors_data, afd_created = AllFloorsData.objects.update_or_create(
-            floor_plan=floorplan,
-            defaults={
-                "json_file_url": all_floors_item.get("json_file_url"),
-                "csv_url": all_floors_item.get("csv_url"),
-                "total_area_csv_url": all_floors_item.get("total_area_csv_url"),
-                "image_labelme_side_by_side_url": all_floors_item.get(
-                    "image_labelme_side_by_side_url"
-                ),
-                "notes": all_floors_item.get("notes", ""),
-            },
+    if not original_request_floorplans:
+        logger.warning(
+            "Proceeding without original request data from Redis. Fallback URL logic disabled."
         )
-        action_afd = "Created" if afd_created else "Updated"
+
+    try:
+        if task_type == "creation":
+            result = _handle_creation_task(analysis_data, original_request_floorplans)
+        elif task_type == "update":
+            # NOTE: With hash IDs, 'update' task type from analyzer might be less relevant,
+            # as we identify floorplans by URL hash. Handling both for compatibility.
+            result = _handle_update_task(analysis_data, original_request_floorplans)
+        else:
+            logger.error("Unknown task type received in webhook: %s", task_type)
+            result = {"error": f"Unknown task type: {task_type}"}
+
+        # --- Optional: Delete Redis key after successful processing ---
+        if (
+            redis_conn
+            and original_request_floorplans
+            and result
+            and not result.get("error")
+        ):  # Check if processing likely succeeded
+            try:
+                redis_conn.delete(redis_key)
+                logger.info(
+                    "Deleted Redis key %s after successful webhook processing.",
+                    redis_key,
+                )
+            except Exception as del_e:
+                logger.error(
+                    "Failed to delete Redis key %s after successful processing: %s",
+                    redis_key,
+                    del_e,
+                )
+        # --- End optional deletion ---
+
         logger.info(
-            "%s AllFloorsData during update for floorplan_id=%s",
-            action_afd,
-            floorplan_id,
+            "Webhook processing completed for task '%s', user '%s', property '%s'. Result: %s",
+            task_type,
+            user_id,
+            property_id,
+            result,
         )
+        return result
 
-        # Update or Create PlanFloors, remove old ones
-        existing_plan_floor_names = set(
-            floorplan.plan_floors.values_list("floor", flat=True)
+    except Exception as e:
+        logger.exception(
+            "Unhandled error during webhook processing for task '%s', user '%s', property '%s': %s",
+            task_type,
+            user_id,
+            property_id,
+            str(e),
         )
-        current_plan_floor_names = set()
-        for floor_data in floors_list:
-            floor_name = floor_data.get("floor")
-            if not floor_name:
+        return {"error": f"Internal server error during webhook processing: {str(e)}"}
+
+
+# --- Private Helper Functions for Webhook Processing ---
+
+
+def _handle_creation_task(analysis_data, original_request_floorplans=None):
+    """Handles the 'creation' task logic."""
+    user_id = analysis_data["user_id"]
+    property_id = analysis_data["property_id"]
+    output_data = analysis_data[
+        "output_data"
+    ]  # This is expected to be the LIST of floorplan results
+    message = analysis_data.get("message", "Floorplan batch created")
+
+    if not isinstance(output_data, list):
+        logger.error(
+            "Webhook 'creation' task expected list for output_data, got %s",
+            type(output_data),
+        )
+        return {"error": "Invalid output_data format for creation task."}
+
+    analysis_result, created = FloorPlanAnalysisResult.objects.update_or_create(
+        user_id=user_id,
+        property_id=property_id,
+        defaults={"message": message},  # Update message on each creation/update
+    )
+    action = "Created" if created else "Updated"
+    logger.info(
+        "%s FloorPlanAnalysisResult (ID: %s) for user %s, property %s.",
+        action,
+        analysis_result.id,
+        user_id,
+        property_id,
+    )
+
+    processed_stable_ids = set()
+    # Process each floorplan item in the list
+    for item_data in output_data:
+        # Assume item_data is a dictionary representing one floorplan's analysis result
+        # It should contain keys like 'floorplan_id' (original request key), 'original_url', 'all_floors', 'floors'
+        api_returned_key = item_data.get("floorplan_id")  # e.g. "fp1"
+        if not api_returned_key:
+            if not api_returned_key:
                 logger.warning(
-                    "Skipping plan floor item due to missing floor name: %s", floor_data
+                    "Skipping item in creation list due to missing or potentially invalid 'floorplan_id' key from API: %s",
+                    item_data.get("floorplan_id", "N/A"),
                 )
-                continue
-            current_plan_floor_names.add(floor_name)
-
-            pf, pf_created = PlanFloor.objects.update_or_create(
-                floor_plan=floorplan,
-                floor=floor_name,
-                defaults={
-                    "label_me_url": floor_data.get("label_me_url"),
-                    "json_file_url": floor_data.get("json_file_url"),
-                    "image_url": floor_data.get("image_url"),
-                    "labelme_image_url": floor_data.get("labelme_image_url"),
-                    "csv_url": floor_data.get(
-                        "csv_url"
-                    ),  # Use floor-specific if needed, else null?
-                    "image_side_by_side_url": floor_data.get("image_side_by_side_url"),
-                },
-            )
-            action_pf = "Created" if pf_created else "Updated"
-            logger.info(
-                "%s PlanFloor for floor=%s during update", action_pf, floor_name
-            )
-
-        # Optional: Remove PlanFloors that are no longer present in the update data
-        floors_to_remove = existing_plan_floor_names - current_plan_floor_names
-        if floors_to_remove:
-            logger.info(
-                "Removing old PlanFloors not in update data: %s", floors_to_remove
-            )
-            floorplan.plan_floors.filter(floor__in=floors_to_remove).delete()
-
-        # Process the main CSV data using the consolidated function
-        csv_url = all_floors_data.csv_url
-        if csv_url:
-            try:
-                logger.info("Downloading updated CSV data from %s", csv_url)
-                csv_response = requests.get(csv_url)
-                csv_response.raise_for_status()
-                csv_content = csv_response.text
-                csv_file = io.StringIO(csv_content)
-                reader = csv.DictReader(csv_file)
-                # Use the consolidated processing function
-                process_csv_data(reader, all_floors_data)
-                logger.info(
-                    "CSV data updated successfully via main CSV for FloorPlan %s",
-                    floorplan_id,
-                )
-            except requests.RequestException as e:
-                logger.error(
-                    "Failed to download or process CSV from %s: %s", csv_url, str(e)
-                )
-            except Exception as e:  # Catch broader errors during CSV processing
-                logger.error(
-                    "Error processing CSV data for floorplan %s during update: %s",
-                    floorplan_id,
-                    str(e),
-                )
-
-        else:
-            logger.warning(
-                "No all_floors.csv URL provided during update for floorplan_id=%s",
-                floorplan_id,
-            )
-            # If URL is removed, clear existing detailed CSV data
-            if all_floors_data.csv_floors.exists():
-                logger.info(
-                    "Deleting existing detailed CSV data as URL is missing during update."
-                )
-                all_floors_data.csv_floors.all().delete()  # Cascade should handle CsvRoom etc.
-
-        # --- Process total_area.csv -> TotalAreaData Model (New Logic) ---
-        total_area_csv_url = all_floors_data.total_area_csv_url
-        processed_area_names = set()
-        if total_area_csv_url:
-            try:
-                logger.info(
-                    "Downloading total_area.csv data from %s (update)",
-                    total_area_csv_url,
-                )
-                total_area_response = requests.get(total_area_csv_url, timeout=30)
-                total_area_response.raise_for_status()
-                total_area_content = total_area_response.text
-                total_area_reader = csv.DictReader(io.StringIO(total_area_content))
-
-                def safe_float(val):  # Redefine or ensure accessible
-                    if val in INVALID_FLOAT_VALUES:
-                        return None
-                    try:
-                        return float(val)
-                    except (ValueError, TypeError):
-                        return None
-
-                def safe_int(val):  # Redefine or ensure accessible
-                    if val in INVALID_INT_VALUES:
-                        return None
-                    try:
-                        return int(float(val))
-                    except (ValueError, TypeError):
-                        return None
-
-                for row in total_area_reader:
-                    area_name = row.get("Area Name")
-                    if not area_name:
-                        logger.warning(
-                            "Skipping total_area.csv row during update due to missing Area Name: %s",
-                            row,
-                        )
-                        continue
-                    processed_area_names.add(area_name)
-
-                    # Use update_or_create for each row
-                    ta_data, ta_created = TotalAreaData.objects.update_or_create(
-                        all_floors_data=all_floors_data,
-                        area_name=area_name,
-                        defaults={  # Map all columns
-                            "square_meters": safe_float(row.get("Square Meters")),
-                            "square_feet": safe_float(row.get("Square Feet")),
-                            "total_floors": safe_int(row.get("Total Floors")),
-                            "total_named_rooms": safe_int(row.get("Total Named Rooms")),
-                            "total_segments": safe_int(row.get("Total Segments")),
-                            "total_points": safe_int(row.get("Total Points")),
-                            "total_objects": safe_int(row.get("Total Objects")),
-                            "total_door_objects": safe_int(
-                                row.get("Total Door Objects")
-                            ),
-                            "total_window_objects": safe_int(
-                                row.get("Total Window Objects")
-                            ),
-                            "total_stair_objects": safe_int(
-                                row.get("Total Stair Objects")
-                            ),
-                            "list_of_objects": row.get("List of Objects"),
-                            "total_pixels": safe_float(row.get("Total Pixels")),
-                            "metric_scale": safe_float(row.get("Metric Scale")),
-                            "imperial_scale": safe_float(row.get("Imperial Scale")),
-                            "input_image_tokens": safe_int(
-                                row.get("Input Image Tokens")
-                            ),
-                            "input_text_tokens": safe_int(row.get("Input Text Tokens")),
-                            "output_text_tokens": safe_int(
-                                row.get("Output Text Tokens")
-                            ),
-                        },
-                    )
-                    action_ta = "Created" if ta_created else "Updated"
-                    logger.info(
-                        "%s TotalAreaData during update for Area Name: %s",
-                        action_ta,
-                        area_name,
-                    )
-
-                # Delete stale TotalAreaData rows for this AllFloorsData
-                stale_total_area_data = all_floors_data.total_area_data.exclude(
-                    area_name__in=processed_area_names
-                )
-                if stale_total_area_data.exists():
-                    logger.info(
-                        "Deleting stale TotalAreaData rows during update: %s",
-                        list(stale_total_area_data.values_list("area_name", flat=True)),
-                    )
-                    stale_total_area_data.delete()
-
-            except requests.RequestException as e:
-                logger.error(
-                    "Failed to download total_area.csv from %s during update: %s",
-                    total_area_csv_url,
-                    str(e),
-                )
-            except Exception as e:
-                logger.error(
-                    "Error processing total_area.csv during update for floorplan %s: %s",
-                    floorplan_id,
-                    str(e),
-                    exc_info=True,
-                )
-        else:
-            logger.warning(
-                "No total_area.csv URL provided during update for floorplan_id=%s",
-                floorplan_id,
-            )
-            # Delete any existing TotalAreaData if the URL is now missing/null
-            if all_floors_data.total_area_data.exists():
-                logger.info(
-                    "Deleting existing TotalAreaData during update as total_area_csv_url is now missing."
-                )
-                all_floors_data.total_area_data.all().delete()
-
-        # Backup the updated floorplan state
+            continue
         try:
-            logger.info(
-                "Backing up updated FloorPlan with id=%s", floorplan.floorplan_id
+            # Process this single floorplan's data, generating a stable ID inside
+            processed_fp_instance = _process_single_floorplan_data(
+                item_data, analysis_result, original_request_floorplans
             )
-            backup_floorplan(floorplan)  # Backup contains the latest state
-            logger.info(
-                "Backup completed for updated FloorPlan id=%s", floorplan.floorplan_id
-            )
+            if processed_fp_instance:
+                processed_stable_ids.add(
+                    processed_fp_instance.floorplan_id
+                )  # Add the stable ID (hash)
         except Exception as e:
-            logger.error(
-                "Error backing up updated FloorPlan %s: %s",
-                floorplan.floorplan_id,
+            logger.exception(
+                "Error processing floorplan item (API Key: %s) during creation for AnalysisResult %s: %s",
+                api_returned_key,
+                analysis_result.id,
                 str(e),
             )
+            # Continue processing other items in the batch
+
+    logger.info(
+        "Finished processing 'creation' task for AnalysisResult %s. Processed floorplan stable IDs: %s",
+        analysis_result.id,
+        processed_stable_ids,
+    )
+    return {
+        "message": "Webhook creation processing completed",
+        "analysis_id": analysis_result.id,
+        "processed_floorplan_ids": list(
+            processed_stable_ids
+        ),  # Return the stable IDs processed
+    }
+
+
+def _handle_update_task(analysis_data):
+    """
+    Handles the 'update' task logic.
+    NOTE: With hash IDs, this might be less common. It processes a single floorplan update.
+    The payload 'output_data' is expected to be a DICT for one floorplan.
+    """
+    user_id = analysis_data["user_id"]
+    property_id = analysis_data["property_id"]
+    output_data = analysis_data[
+        "output_data"
+    ]  # Expected to be a DICT for one floorplan result
+
+    if not isinstance(output_data, dict):
+        logger.error(
+            "Webhook 'update' task expected dict for output_data, got %s",
+            type(output_data),
+        )
+        return {"error": "Invalid output_data format for update task."}
+
+    # The 'floorplan_id' in the update payload is likely the original request key ('fp1')
+    # We need the original_url to find/update the correct record via hash.
+    original_request_key = output_data.get("floorplan_id")
+    original_url = output_data.get("original_url")
+
+    if not original_request_key or not original_url:
+        logger.error(
+            "Missing floorplan_id (original key) or original_url in update payload: %s",
+            output_data,
+        )
+        return {"error": "Missing floorplan_id or original_url in update payload"}
+
+    try:
+        # Find the *AnalysisResult* first, as FloorPlan ID is now derived
+        analysis_result = FloorPlanAnalysisResult.objects.get(
+            user_id=user_id, property_id=property_id
+        )
+
+        logger.info(
+            "Processing update for AnalysisResult ID %s (User: %s, Prop: %s)",
+            analysis_result.id,
+            user_id,
+            property_id,
+        )
+
+        # Use the hash of the URL to find/update the FloorPlan
+        stable_floorplan_id = FloorPlan.generate_hash_id(original_url)
+        logger.info(
+            "Processing update for AnalysisResult ID %s, attempting to find/update FloorPlan with Hash ID %s",
+            analysis_result.id,
+            stable_floorplan_id,
+        )
+
+        # Process this single floorplan's data, generating/using the stable ID inside
+        processed_fp_instance = _process_single_floorplan_data(
+            output_data, analysis_result, is_update=True
+        )  # Pass is_update flag if needed
+
+        if not processed_fp_instance:
+            return {
+                "error": f"Failed to process update for floorplan URL: {original_url}"
+            }
+
+        logger.info(
+            "Finished processing 'update' task for floorplan stable ID %s.",
+            stable_floorplan_id,
+        )
 
         return {
             "message": "Floor update processing completed",
-            "floorplan_id": floorplan_id,
+            "floorplan_id": stable_floorplan_id,
+            "analysis_id": analysis_result.id,
         }
 
+    except FloorPlanAnalysisResult.DoesNotExist:
+        logger.error(
+            "FloorPlanAnalysisResult for user '%s', property '%s' does not exist for update.",
+            user_id,
+            property_id,
+        )
+        return {
+            "error": f"FloorPlanAnalysisResult for {user_id}/{property_id} not found for update."
+        }
+    except ValueError as ve:  # Catch hashing errors
+        logger.error("Error generating hash during update task: %s", ve)
+        return {"error": f"Failed to generate hash ID for update: {ve}"}
+    except Exception as e:
+        logger.exception(
+            "Error during update task for floorplan (Original Key: '%s'): %s",
+            original_request_key,
+            str(e),
+        )
+        return {
+            "error": f"Failed to process update for floorplan (Original Key: {original_request_key})."
+        }
+
+
+def _process_single_floorplan_data(
+    item_data, analysis_result, original_request_floorplans=None, is_update=False
+):
+    """
+    Processes the data for a single floorplan item received from the webhook.
+    Generates a stable ID hash from the original_url.
+    Uses update_or_create for FloorPlan based on hash ID.
+    Returns the processed FloorPlan instance or None on failure.
+    """
+    api_returned_key = item_data.get("floorplan_id")  # e.g., "fp1"
+    api_returned_url = item_data.get("original_url")
+    all_floors_item = item_data.get("all_floors")  # Dict for AllFloorsData URLs etc.
+    floors_list = item_data.get("floors", [])  # List for PlanFloor data
+
+    if not all_floors_item:
+        logger.warning(
+            "Skipping floorplan item processing (API Key: %s) due to missing 'all_floors' data in webhook item: %s",
+            api_returned_key,
+            item_data,
+        )  # Indicate failure
+
+    url_to_hash = None
+    source_url_for_db = None
+
+    if (
+        api_returned_url
+        and isinstance(api_returned_url, str)
+        and api_returned_url.strip()
+    ):
+        url_to_hash = api_returned_url.strip()
+        source_url_for_db = url_to_hash
+        logger.info("Using original_url directly from API response: %s", url_to_hash)
+    elif original_request_floorplans and api_returned_key:
+        logger.warning(
+            "API did not return a valid original_url for key '%s'. Attempting fallback using original request data from Redis.",
+            api_returned_key,
+        )
+        original_request_item = original_request_floorplans.get(api_returned_key)
+        if original_request_item and isinstance(original_request_item, dict):
+            fallback_url = original_request_item.get("url")
+            if fallback_url and isinstance(fallback_url, str) and fallback_url.strip():
+                url_to_hash = fallback_url.strip()
+                source_url_for_db = url_to_hash
+                logger.warning(
+                    "Fallback successful: Using original request URL '%s' for API key '%s'.",
+                    url_to_hash,
+                    api_returned_key,
+                )
+            else:
+                logger.error(
+                    "Fallback failed: Found original request item for key '%s', but its URL is missing or invalid.",
+                    api_returned_key,
+                )
+        else:
+            # Handle if the key from API doesn't match keys in stored data
+            logger.error(
+                "Fallback failed: Could not find original request data in Redis for the key '%s' returned by the API.",
+                api_returned_key,
+            )
     else:
-        logger.error("Unknown task type received in webhook: %s", task_type)
-        return {"error": f"Unknown task type: {task_type}"}
+        logger.error(
+            "Cannot determine URL for hashing. API Key: '%s'. API URL: '%s'. Original request data available: %s",
+            api_returned_key,
+            api_returned_url,
+            bool(original_request_floorplans),
+        )
+
+    if not url_to_hash:
+        logger.error(
+            "Failed to obtain a valid URL for floorplan item. Skipping processing. Item data: %s",
+            item_data,
+        )
+        return None
+
+    # --- Generate ID based on URL Hash using Model's static method ---
+    try:
+        stable_floorplan_id = FloorPlan.generate_hash_id(url_to_hash)
+    except ValueError as hash_exc:  # Catch specific error from generate_hash_id
+        logger.error(
+            f"Failed to hash URL '{url_to_hash}'. Skipping this floorplan. Error: {hash_exc}"
+        )
+        return None  # Indicate failure
+
+    logger.info(
+        f"Processing floorplan item (API Key: {api_returned_key}, URL Used for Hash: {url_to_hash}, Assigned Stable ID (Hash): {stable_floorplan_id})"
+    )
+
+    # 1. Update or Create FloorPlan using the STABLE HASH ID
+    #    Use floorplan_id=stable_floorplan_id and ensure it's unique=True in model
+    floorplan_defaults = {
+        "analysis_result": analysis_result,  # Ensure analysis_result is passed in defaults for creation
+        "original_url": source_url_for_db,
+    }
+    try:
+        floorplan, fp_created = FloorPlan.objects.update_or_create(
+            floorplan_id=stable_floorplan_id, defaults=floorplan_defaults
+        )
+    except Exception as db_exc:
+        logger.exception(
+            "Database error during FloorPlan update_or_create for hash %s (URL: %s): %s",
+            stable_floorplan_id,
+            source_url_for_db,
+            db_exc,
+        )
+        return None
+    action_fp = "Created" if fp_created else "Updated"
+    logger.info("%s FloorPlan with Stable ID (Hash)=%s", action_fp, stable_floorplan_id)
+
+    # 2. Update or Create AllFloorsData
+    all_floors_defaults = {
+        "json_file_url": all_floors_item.get("json_file_url"),
+        "csv_url": all_floors_item.get("csv_url"),
+        "total_area_csv_url": all_floors_item.get("total_area_csv_url"),
+        "image_labelme_side_by_side_url": all_floors_item.get(
+            "image_labelme_side_by_side_url"
+        ),
+        "notes": all_floors_item.get("notes", ""),
+    }
+    all_floors_defaults = {
+        k: v for k, v in all_floors_defaults.items() if v is not None
+    }
+
+    all_floors_data, afd_created = AllFloorsData.objects.update_or_create(
+        floor_plan=floorplan,  # Link using the FloorPlan object
+        defaults=all_floors_defaults,
+    )
+    action_afd = "Created" if afd_created else "Updated"
+    logger.info(
+        "%s AllFloorsData for Stable Floorplan ID=%s", action_afd, stable_floorplan_id
+    )
+
+    # 3. Update or Create PlanFloors (handle deletions)
+    _update_plan_floors(floorplan, floors_list)
+
+    # 4. Process the main CSV (all_floors.csv) -> Structured data + Raw Rows
+    _process_main_csv(all_floors_data)
+
+    # 5. Process the total_area.csv -> TotalAreaData model
+    _process_total_area_csv(all_floors_data)
+
+    # 6. Backup the processed state
+    _perform_backup(floorplan)
+
+    return floorplan  # Return the processed instance
 
 
-def process_csv_data(reader, all_floors_data):
-    """
-    Process CSV rows using update_or_create for all CSV-level models.
-    This function handles both initial creation and full updates based on
-    the provided all_floors_data instance. It also removes rooms for a floor
-    that are no longer present in the current CSV data for that floor.
-    """
-    # Keep track of floors and rooms processed in this CSV run
-    processed_floor_names = set()
-    processed_room_ids_by_floor = {}  # {floor_name: {room_id1, room_id2, ...}}
+def _update_plan_floors(floorplan, floors_list_data):
+    """Updates PlanFloor entries based on the provided list, deleting orphans."""
+    existing_plan_floor_names = set(
+        floorplan.plan_floors.values_list("floor", flat=True)
+    )
+    current_plan_floor_names = set()
 
-    floor_cache = {}  # Cache CsvFloor instances for efficiency within this run
-
-    for row in reader:
-        floor_name = row.get("Floor_Name")  # Might be 'unknown'
-        room_id_str = row.get("Room_id")
-
-        # Skip row if essential Floor_Name is missing
-        if floor_name is None or floor_name.strip() == "":
-            logger.warning("Skipping CSV row due to missing Floor_Name: %s", row)
-            continue
-        # Skip row if essential Room_id is missing or invalid
-        if not room_id_str:
-            logger.warning("Skipping CSV row due to missing Room_id: %s", row)
-            continue
-
-        try:
-            # Use float for Room_id as in the model, handle potential ValueError
-            room_id = float(room_id_str)
-        except ValueError:
+    for floor_data in floors_list_data:
+        floor_name = floor_data.get("floor")
+        if not floor_name:
             logger.warning(
-                "Skipping CSV row due to invalid Room_id format '%s': %s",
+                "Skipping plan floor item due to missing floor name for floorplan %s: %s",
+                floorplan.floorplan_id,
+                floor_data,
+            )
+            continue
+        current_plan_floor_names.add(floor_name)
+
+        plan_floor_defaults = {
+            "label_me_url": floor_data.get("label_me_url"),
+            "json_file_url": floor_data.get("json_file_url"),
+            "image_url": floor_data.get("image_url"),
+            "labelme_image_url": floor_data.get("labelme_image_url"),
+            "csv_url": floor_data.get("csv_url"),
+            "image_side_by_side_url": floor_data.get("image_side_by_side_url"),
+        }
+        plan_floor_defaults = {
+            k: v for k, v in plan_floor_defaults.items() if v is not None
+        }
+
+        pf, pf_created = PlanFloor.objects.update_or_create(
+            floor_plan=floorplan,
+            floor=floor_name,
+            defaults=plan_floor_defaults,
+        )
+        # action_pf = "Created" if pf_created else "Updated" # Less verbose logging
+
+    floors_to_remove = existing_plan_floor_names - current_plan_floor_names
+    if floors_to_remove:
+        logger.info(
+            "Removing %d old PlanFloors for floorplan %s not in new data: %s",
+            len(floors_to_remove),
+            floorplan.floorplan_id,
+            floors_to_remove,
+        )
+        floorplan.plan_floors.filter(floor__in=floors_to_remove).delete()
+
+
+def _download_csv_content(csv_url, context_msg):
+    """Downloads CSV content from a URL, handles errors."""
+    if not csv_url:
+        logger.warning("No CSV URL provided for %s.", context_msg)
+        return None
+    try:
+        logger.info("Downloading CSV for %s from %s", context_msg, csv_url)
+        response = requests.get(csv_url, timeout=30)
+        response.raise_for_status()
+        return response.text
+    except requests.Timeout:
+        logger.error("Timeout downloading CSV for %s from %s", context_msg, csv_url)
+        return None
+    except requests.RequestException as e:
+        logger.error(
+            "Failed to download CSV for %s from %s: %s", context_msg, csv_url, str(e)
+        )
+        return None
+
+
+def _process_main_csv(all_floors_data):
+    """Downloads and processes the main all_floors.csv."""
+    csv_url = all_floors_data.csv_url
+    context_msg = f"main CSV (all_floors) for AllFloorsData ID {all_floors_data.id} (FloorPlan: {all_floors_data.floor_plan.floorplan_id})"
+    csv_content = _download_csv_content(csv_url, context_msg)
+
+    if csv_content:
+        try:
+            csv_file = io.StringIO(csv_content)
+            # Handle BOM
+            header = csv_file.readline()
+            if header.startswith("\ufeff"):
+                header = header[1:]
+            csv_file.seek(0)
+            if header.startswith("\ufeff"):
+                csv_file = io.StringIO(csv_content.decode("utf-8-sig"))
+
+            reader = csv.DictReader(csv_file)
+            rows = list(reader)
+
+            process_structured_csv_data(rows, all_floors_data)
+            process_raw_csv_rows(rows, all_floors_data, reader.fieldnames)
+
+            logger.info("Main CSV processed successfully for %s", context_msg)
+
+        except Exception as e:
+            logger.exception(
+                "Error processing main CSV content for %s: %s", context_msg, str(e)
+            )
+            # Clear data on error?
+            # all_floors_data.csv_floors.all().delete()
+            # all_floors_data.all_floors_raw_rows.all().delete()
+
+    else:
+        logger.warning(
+            "No main CSV content to process for %s. Clearing existing data.",
+            context_msg,
+        )
+        all_floors_data.csv_floors.all().delete()
+        all_floors_data.all_floors_raw_rows.all().delete()
+
+
+def process_structured_csv_data(rows, all_floors_data):
+    """
+    Processes CSV rows into structured models (CsvFloor, CsvRoom, etc.).
+    Uses update_or_create and handles deletion of orphans.
+    Uses 'unspecified_floor' for blank/unknown floor names.
+    """
+    processed_floor_names = set()
+    processed_room_ids_by_floor = {}
+    floor_cache = {}
+
+    for row in rows:
+        floor_name_raw = row.get("Floor_Name")
+        floor_name = safe_string(floor_name_raw)  # Handles None, trims whitespace
+
+        # Assign a default if the name is missing, empty, or explicitly 'unknown'
+        if not floor_name or floor_name.lower() == "unknown":
+            floor_name = "unspecified_floor"  # Single placeholder
+
+        room_id_str = row.get("Room_id")
+        room_id = safe_float(room_id_str)
+
+        if room_id is None:
+            logger.warning(
+                "Skipping CSV row for floor '%s' due to invalid/missing Room_id ('%s'). Row snippet: %s",
+                floor_name,
                 room_id_str,
-                row,
+                {
+                    k: v
+                    for k, v in row.items()
+                    if k in ["Room_id", "Room_Name", "Floor_Name"]
+                },
             )
             continue
 
         processed_floor_names.add(floor_name)
-        if floor_name not in processed_room_ids_by_floor:
-            processed_room_ids_by_floor[floor_name] = set()
-        processed_room_ids_by_floor[floor_name].add(room_id)
+        processed_room_ids_by_floor.setdefault(floor_name, set()).add(room_id)
 
-        # --- Process CsvFloor (Includes total areas) ---
+        # --- Process CsvFloor ---
         if floor_name not in floor_cache:
             floor, f_created = CsvFloor.objects.update_or_create(
                 all_floors_data=all_floors_data,
                 floor_name=floor_name,
                 defaults={
-                    # Get floor total areas from the row, handle invalid values
                     "calculated_total_area_metric": safe_float(
-                        row, "Calculated Floor Total Sq Area Metric"
+                        row.get("Calculated Floor Total Sq Area Metric")
                     ),
                     "calculated_total_area_imperial": safe_float(
-                        row, "Calculated Floor Total Sq Area Imperial"
+                        row.get("Calculated Floor Total Sq Area Imperial")
                     ),
                 },
             )
             floor_cache[floor_name] = floor
-            action = "Created" if f_created else "Updated"
-            # logger.debug("%s CsvFloor: %s", action, floor_name) # Optional detailed logging
         else:
-            floor = floor_cache[floor_name]  # Use cached instance
+            floor = floor_cache[floor_name]
 
         # --- Process CsvRoom ---
+        room_defaults = {
+            "room_name": safe_string(row.get("Room_Name")),
+            "is_segment": safe_string(row.get("is_segment")),
+            "no_of_doors": safe_float(row.get("No_of_door")),
+            "no_of_windows": safe_float(row.get("No_of_window")),
+            "no_of_room_points": safe_float(row.get("No_of_room_points")),
+        }
         room, r_created = CsvRoom.objects.update_or_create(
             floor=floor,
-            room_id=room_id,  # Use room_id as the unique key within a floor
-            defaults={
-                "room_name": row.get("Room_Name"),
-                "is_segment": row.get("is_segment") or None,  # Handle empty string
-                "no_of_doors": safe_float(row, "No_of_door"),  # Pass row
-                "no_of_windows": safe_float(row, "No_of_window"),  # Pass row
-                "no_of_room_points": safe_float(row, "No_of_room_points"),  # Pass row
-            },
+            room_id=room_id,
+            defaults=room_defaults,
         )
-        action = "Created" if r_created else "Updated"
-        # logger.debug("%s CsvRoom: %s (ID: %s)", action, row.get("Room_Name"), room_id)
 
-        # --- Process CsvRoomPixelData ---
-        pixel_defaults = {
-            "min_x_pixels": safe_float(row, "Min X Pixels"),  # Pass row
-            "min_y_pixels": safe_float(row, "Min Y Pixels"),
-            "max_x_pixels": safe_float(row, "Max X Pixels"),
-            "max_y_pixels": safe_float(row, "Max Y Pixels"),
-            "max_area_pixels": safe_float(row, "Max Area Pixels"),
-            "actual_area_pixels": safe_float(row, "Actual Area Pixels"),
-            "pixel_ratio": safe_float(row, "Pixel ratio"),  # Pass row
-        }
+        _update_or_create_room_details(room, row)
 
-        # Only update/create if there's any non-null pixel data in the row
-        if any(v is not None for v in pixel_defaults.values()):
-            CsvRoomPixelData.objects.update_or_create(
-                room=room, defaults=pixel_defaults
-            )
-        else:
-            # Optional: Delete pixel data if it exists but the row has no values now
-            CsvRoomPixelData.objects.filter(room=room).delete()
-
-        # --- Process CsvRoomDimensions ---
-        dimension_defaults = {
-            "dimensions_imperial": safe_dimension(
-                row, "dimensions_imperial"
-            ),  # Pass row
-            "dimensions_metric": safe_dimension(row, "dimensions_metric"),  # Pass row
-            "max_area_metric": safe_float(row, "Max Area Metric"),  # Pass row
-            "max_area_imperial": safe_float(row, "Max Area Imperial"),  # Pass row
-            "calculated_sq_area_metric": safe_float(
-                row, "Calculated Sq Area Metric"
-            ),  # Pass row
-            "calculated_area_imperial": safe_float(
-                row, "calculated_area_imperial"
-            ),  # Pass row
-        }
-        # Only update/create if there's any non-null dimension data in the row
-        if any(v is not None for v in dimension_defaults.values()):
-            CsvRoomDimensions.objects.update_or_create(
-                room=room, defaults=dimension_defaults
-            )
-        else:
-            # Optional: Delete dimension data if it exists but the row has no values now
-            CsvRoomDimensions.objects.filter(room=room).delete()
-
-        # --- Process CsvRoomScalingFactors ---
-        scaling_defaults = {
-            "scale_metric": safe_float(row, "Scale Metric"),
-            "scale_imperial": safe_float(row, "Scale Imperial"),
-        }
-
-        # Only update/create if there's any non-null scaling data in the row
-        if any(v is not None for v in scaling_defaults.values()):
-            CsvRoomScalingFactors.objects.update_or_create(
-                room=room, defaults=scaling_defaults
-            )
-        else:
-            # Optional: Delete scaling data if it exists but the row has no values now
-            CsvRoomScalingFactors.objects.filter(room=room).delete()
-
-    # --- Clean up old data ---
-    # Get all CsvFloors associated with this AllFloorsData
-    existing_floors = all_floors_data.csv_floors.all()
-
-    # Delete CsvFloors (and their cascade-deleted rooms) that were NOT in this CSV run
-    floors_to_delete = existing_floors.exclude(floor_name__in=processed_floor_names)
+    # --- Clean up old structured data ---
+    floors_to_delete = all_floors_data.csv_floors.exclude(
+        floor_name__in=processed_floor_names
+    )
     if floors_to_delete.exists():
+        deleted_floor_names = list(
+            floors_to_delete.values_list("floor_name", flat=True)
+        )
         logger.info(
-            "Deleting CsvFloors (and related rooms) no longer present in CSV: %s",
-            list(floors_to_delete.values_list("floor_name", flat=True)),
+            "Deleting %d CsvFloors (and related rooms) for AllFloorsData %d no longer present in CSV: %s",
+            floors_to_delete.count(),
+            all_floors_data.id,
+            deleted_floor_names,
         )
         floors_to_delete.delete()
 
-    # For floors that WERE processed, delete rooms that were NOT in this CSV run
     for floor_name, processed_room_ids in processed_room_ids_by_floor.items():
-        if floor_name in floor_cache:  # Ensure the floor object is available
+        if floor_name in floor_cache:
             csv_floor = floor_cache[floor_name]
             rooms_to_delete = csv_floor.rooms.exclude(room_id__in=processed_room_ids)
             if rooms_to_delete.exists():
+                deleted_room_ids = list(
+                    rooms_to_delete.values_list("room_id", flat=True)
+                )
                 logger.info(
-                    "Deleting CsvRooms for floor '%s' no longer present in CSV: %s",
+                    "Deleting %d CsvRooms for floor '%s' (AllFloorsData %d) no longer present in CSV: %s",
+                    rooms_to_delete.count(),
                     floor_name,
-                    list(rooms_to_delete.values_list("room_id", flat=True)),
+                    all_floors_data.id,
+                    deleted_room_ids,
                 )
                 rooms_to_delete.delete()
 
     logger.info(
-        "CSV data processing finished for AllFloorsData id=%s", all_floors_data.id
+        "Structured CSV data processing finished for AllFloorsData id=%s",
+        all_floors_data.id,
     )
 
 
+def _update_or_create_room_details(room, row_data):
+    """Helper to update/create related OneToOne room details."""
+    # --- Pixel Data ---
+    pixel_defaults = {
+        "min_x_pixels": safe_float(row_data.get("Min X Pixels")),
+        "min_y_pixels": safe_float(row_data.get("Min Y Pixels")),
+        "max_x_pixels": safe_float(row_data.get("Max X Pixels")),
+        "max_y_pixels": safe_float(row_data.get("Max Y Pixels")),
+        "max_area_pixels": safe_float(row_data.get("Max Area Pixels")),
+        "actual_area_pixels": safe_float(row_data.get("Actual Area Pixels")),
+        "pixel_ratio": safe_float(row_data.get("Pixel ratio")),
+    }
+    if any(v is not None for v in pixel_defaults.values()):
+        CsvRoomPixelData.objects.update_or_create(room=room, defaults=pixel_defaults)
+    else:
+        CsvRoomPixelData.objects.filter(room=room).delete()
+
+    # --- Dimensions ---
+    dimension_defaults = {
+        "dimensions_imperial": safe_dimension(row_data.get("dimensions_imperial")),
+        "dimensions_metric": safe_dimension(row_data.get("dimensions_metric")),
+        "max_area_metric": safe_float(row_data.get("Max Area Metric")),
+        "max_area_imperial": safe_float(row_data.get("Max Area Imperial")),
+        "calculated_sq_area_metric": safe_float(
+            row_data.get("Calculated Sq Area Metric")
+        ),
+        "calculated_area_imperial": safe_float(
+            row_data.get("calculated_area_imperial")
+        ),
+    }
+    if any(v is not None for v in dimension_defaults.values()):
+        CsvRoomDimensions.objects.update_or_create(
+            room=room, defaults=dimension_defaults
+        )
+    else:
+        CsvRoomDimensions.objects.filter(room=room).delete()
+
+    # --- Scaling Factors ---
+    scaling_defaults = {
+        "scale_metric": safe_float(row_data.get("Scale Metric")),
+        "scale_imperial": safe_float(row_data.get("Scale Imperial")),
+    }
+    if any(v is not None for v in scaling_defaults.values()):
+        CsvRoomScalingFactors.objects.update_or_create(
+            room=room, defaults=scaling_defaults
+        )
+    else:
+        CsvRoomScalingFactors.objects.filter(room=room).delete()
+
+
+def process_raw_csv_rows(rows, all_floors_data, fieldnames):
+    """
+    Deletes existing raw rows for the AllFloorsData instance
+    and bulk creates new AllFloorsCsvRawRow objects from the provided rows.
+    """
+    logger.info(
+        "Processing raw CSV rows for AllFloorsData ID %d...", all_floors_data.id
+    )
+
+    # Delete existing raw rows first for a clean slate
+    count, _ = all_floors_data.all_floors_raw_rows.all().delete()
+    if count > 0:
+        logger.debug(
+            "Deleted %d existing raw CSV rows for AllFloorsData ID %d.",
+            count,
+            all_floors_data.id,
+        )
+
+    raw_rows_to_create = []
+    for row_dict in rows:
+        # Map ALL fields present in the model definition for AllFloorsCsvRawRow
+        # Using safe helpers ensures type consistency and handles bad data gracefully
+        raw_row_instance = AllFloorsCsvRawRow(
+            all_floors_data=all_floors_data,
+            floor_name=safe_string(row_dict.get("Floor_Name")),
+            room_name=safe_string(row_dict.get("Room_Name")),
+            is_segment=safe_string(row_dict.get("is_segment")),
+            room_id=safe_float(row_dict.get("Room_id")),
+            no_of_door=safe_float(row_dict.get("No_of_door")),
+            no_of_window=safe_float(row_dict.get("No_of_window")),
+            no_of_room_points=safe_float(row_dict.get("No_of_room_points")),
+            min_x_pixels=safe_float(row_dict.get("Min X Pixels")),
+            min_y_pixels=safe_float(row_dict.get("Min Y Pixels")),
+            max_x_pixels=safe_float(row_dict.get("Max X Pixels")),
+            max_y_pixels=safe_float(row_dict.get("Max Y Pixels")),
+            dimensions_imperial=safe_dimension(row_dict.get("dimensions_imperial")),
+            dimensions_metric=safe_dimension(row_dict.get("dimensions_metric")),
+            max_area_metric=safe_float(row_dict.get("Max Area Metric")),
+            max_area_imperial=safe_float(row_dict.get("Max Area Imperial")),
+            max_area_pixels=safe_float(row_dict.get("Max Area Pixels")),
+            actual_area_pixels=safe_float(row_dict.get("Actual Area Pixels")),
+            pixel_ratio=safe_float(row_dict.get("Pixel ratio")),
+            scale_metric=safe_float(row_dict.get("Scale Metric")),
+            scale_imperial=safe_float(row_dict.get("Scale Imperial")),
+            calculated_sq_area_metric=safe_float(
+                row_dict.get("Calculated Sq Area Metric")
+            ),
+            calculated_floor_total_sq_area_metric=safe_float(
+                row_dict.get("Calculated Floor Total Sq Area Metric")
+            ),
+            calculated_area_imperial=safe_float(
+                row_dict.get("calculated_area_imperial")
+            ),
+            calculated_floor_total_sq_area_imperial=safe_float(
+                row_dict.get("Calculated Floor Total Sq Area Imperial")
+            ),
+            # Explicitly ignore numbered columns or other unwanted fields from CSV
+        )
+        raw_rows_to_create.append(raw_row_instance)
+
+    if raw_rows_to_create:
+        try:
+            created_rows = AllFloorsCsvRawRow.objects.bulk_create(raw_rows_to_create)
+            logger.info(
+                "Successfully created %d new raw CSV rows for AllFloorsData ID %d.",
+                len(created_rows),
+                all_floors_data.id,
+            )
+        except Exception as e:
+            logger.exception(
+                "Error during bulk creation of raw CSV rows for AllFloorsData ID %d: %s",
+                all_floors_data.id,
+                str(e),
+            )
+    else:
+        logger.info(
+            "No valid raw CSV rows to create for AllFloorsData ID %d.",
+            all_floors_data.id,
+        )
+
+
+def _process_total_area_csv(all_floors_data):
+    """Downloads and processes the total_area.csv."""
+    total_area_csv_url = all_floors_data.total_area_csv_url
+    context_msg = f"total_area.csv for AllFloorsData ID {all_floors_data.id} (FloorPlan: {all_floors_data.floor_plan.floorplan_id})"
+    csv_content = _download_csv_content(total_area_csv_url, context_msg)
+    processed_area_names = set()
+
+    if csv_content:
+        try:
+            csv_file = io.StringIO(csv_content)
+            # Handle BOM
+            header = csv_file.readline()
+            if header.startswith("\ufeff"):
+                header = header[1:]
+            csv_file.seek(0)
+            if header.startswith("\ufeff"):
+                csv_file = io.StringIO(csv_content.decode("utf-8-sig"))
+
+            reader = csv.DictReader(csv_file)
+
+            for row in reader:
+                area_name = safe_string(row.get("Area Name"))
+                if not area_name:
+                    logger.warning(
+                        "Skipping total_area.csv row due to missing Area Name for %s: %s",
+                        context_msg,
+                        row,
+                    )
+                    continue
+                processed_area_names.add(area_name)
+
+                defaults = {
+                    "square_meters": safe_float(row.get("Square Meters")),
+                    "square_feet": safe_float(row.get("Square Feet")),
+                    "total_floors": safe_int(row.get("Total Floors")),
+                    "total_named_rooms": safe_int(row.get("Total Named Rooms")),
+                    "total_segments": safe_int(row.get("Total Segments")),
+                    "total_points": safe_int(row.get("Total Points")),
+                    "total_objects": safe_int(row.get("Total Objects")),
+                    "total_door_objects": safe_int(row.get("Total Door Objects")),
+                    "total_window_objects": safe_int(row.get("Total Window Objects")),
+                    "total_stair_objects": safe_int(row.get("Total Stair Objects")),
+                    "list_of_objects": safe_string(row.get("List of Objects")),
+                    "total_actual_pixels": safe_float(row.get("Total Pixels")),
+                    "metric_scale": safe_float(row.get("Metric Scale")),
+                    "imperial_scale": safe_float(row.get("Imperial Scale")),
+                    "input_image_tokens": safe_int(row.get("Input Image Tokens")),
+                    "input_text_tokens": safe_int(row.get("Input Text Tokens")),
+                    "output_text_tokens": safe_int(row.get("Output Text Tokens")),
+                }
+
+                # Use update_or_create to handle potential re-processing
+                ta_data, ta_created = TotalAreaData.objects.update_or_create(
+                    all_floors_data=all_floors_data,
+                    area_name=area_name,
+                    defaults=defaults,
+                )
+
+            # Delete stale TotalAreaData rows
+            stale_total_area_data = all_floors_data.total_area_data.exclude(
+                area_name__in=processed_area_names
+            )
+            if stale_total_area_data.exists():
+                deleted_area_names = list(
+                    stale_total_area_data.values_list("area_name", flat=True)
+                )
+                logger.info(
+                    "Deleting %d stale TotalAreaData rows for %s: %s",
+                    stale_total_area_data.count(),
+                    context_msg,
+                    deleted_area_names,
+                )
+                stale_total_area_data.delete()
+
+            logger.info("Total Area CSV processed successfully for %s", context_msg)
+
+        except Exception as e:
+            logger.exception(
+                "Error processing total_area.csv content for %s: %s",
+                context_msg,
+                str(e),
+            )
+            # Clear data on error?
+            # all_floors_data.total_area_data.all().delete()
+
+    else:
+        logger.warning(
+            "No total_area.csv content to process for %s. Clearing existing data.",
+            context_msg,
+        )
+        all_floors_data.total_area_data.all().delete()
+
+
+def _perform_backup(floorplan):
+    """Calls the backup utility function, handling potential errors."""
+    try:
+        # Ensure floorplan object is valid and has the stable ID
+        if not floorplan or not floorplan.floorplan_id:
+            logger.error("Backup skipped: Invalid floorplan object provided.")
+            return
+
+        logger.info("Attempting backup for floorplan_id=%s", floorplan.floorplan_id)
+        backup_floorplan(floorplan)
+        logger.info("Backup call completed for floorplan_id=%s", floorplan.floorplan_id)
+    except Exception as e:
+        logger.exception(
+            "Error during backup attempt for floorplan_id %s: %s",
+            getattr(floorplan, "floorplan_id", "N/A"),
+            str(e),
+        )
+
+
 # floorplan/models.py
+import hashlib
+
 from django.db import models
 from simple_history.models import HistoricalRecords
+
+from floorplan_service.config.logging_config import configure_logger
+from helpers.models import TrackingModel
+
+logger = configure_logger(__name__)
 
 # === API-Level Models ===
 
@@ -926,16 +1223,33 @@ class FloorPlan(models.Model):
     analysis_result = models.ForeignKey(
         FloorPlanAnalysisResult, related_name="floor_plans", on_delete=models.CASCADE
     )
-    floorplan_id = models.CharField(max_length=255)
-    original_url = models.URLField()
+    # Change CharField max_length to 64 for SHA256 hex digest and add unique=True
+    floorplan_id = models.CharField(
+        max_length=64, unique=True, db_index=True
+    )  # Ensures DB-level uniqueness and speeds up lookups
+    original_url = models.URLField(
+        max_length=1024
+    )  # Increase max_length for potentially long URLs
     history = HistoricalRecords()
 
-    class Meta:
-        # Enforce uniqueness for the combination within this model
-        unique_together = ("analysis_result", "floorplan_id")
-
     def __str__(self):
-        return f"{self.floorplan_id} (Analysis: {self.analysis_result_id})"
+        # Show first 8 chars of hash for brevity in admin dropdowns etc.
+        short_hash = self.floorplan_id[:8] if self.floorplan_id else "N/A"
+        return f"FP Hash: {short_hash}... (Analysis: {self.analysis_result_id})"
+
+    @staticmethod
+    def generate_hash_id(url):
+        """Generates a SHA-256 hash for a given URL string."""
+        if not url:
+            raise ValueError("Cannot generate hash for an empty URL")
+        try:
+            url_bytes = url.encode("utf-8")
+            return hashlib.sha256(url_bytes).hexdigest()
+        except Exception as e:
+            logger.error(f"Error generating hash for URL '{url}': {e}")
+            # You might want a more robust fallback or error handling here
+            # For now, re-raise to indicate a problem
+            raise ValueError(f"Hashing failed for URL: {url}") from e
 
 
 class AllFloorsData(models.Model):
@@ -975,8 +1289,6 @@ class PlanFloor(models.Model):
 
 
 # === CSV Data Models ===
-
-
 class CsvFloor(models.Model):
     """
     Represents each row group from the CSV (identified by Floor_Name).
@@ -1213,7 +1525,7 @@ class TotalAreaData(models.Model):
     list_of_objects = models.TextField(
         null=True, blank=True
     )  # Store the list representation as text
-    total_pixels = models.FloatField(null=True, blank=True)
+    total_actual_pixels = models.FloatField(null=True, blank=True)
     metric_scale = models.FloatField(null=True, blank=True)
     imperial_scale = models.FloatField(null=True, blank=True)
     input_image_tokens = models.IntegerField(null=True, blank=True)
@@ -1232,8 +1544,6 @@ class TotalAreaData(models.Model):
 
 
 # csv has been renamed to all_floors.csv
-# parse and store total_area csv
-# Total Pixels should be Total Actual Pixels on our system
 # save metabase sql for the report writing so that
 
 
@@ -1299,13 +1609,33 @@ class AllFloorsDataInline(admin.StackedInline):
 
 @admin.register(FloorPlan)
 class FloorPlanAdmin(admin.ModelAdmin):
-    list_display = ("floorplan_id", "get_property_id", "get_user_id")
+    list_display = (
+        "get_short_floorplan_id",
+        "get_property_id",
+        "get_user_id",
+        "original_url",
+    )
     search_fields = (
-        "floorplan_id",
+        "floorplan_id",  # Search the full hash
         "analysis_result__property_id",
         "analysis_result__user_id",
+        "original_url",  # Search the URL
     )
+    # Make floorplan_id readonly since it's auto-generated
+    readonly_fields = ("floorplan_id",)
     inlines = [AllFloorsDataInline, PlanFloorInline]
+    list_select_related = ("analysis_result",)  # Optimize query
+
+    def get_short_floorplan_id(self, obj):
+        # Show first 8 and last 4 chars of hash
+        if obj.floorplan_id:
+            return f"{obj.floorplan_id[:8]}...{obj.floorplan_id[-4:]}"
+        return "N/A"
+
+    get_short_floorplan_id.short_description = "Floorplan ID (Hash)"
+    get_short_floorplan_id.admin_order_field = (
+        "floorplan_id"  # Allow sorting by full hash
+    )
 
     def get_property_id(self, obj):
         return obj.analysis_result.property_id
@@ -1684,136 +2014,2001 @@ class FloorPlanWebhookView(APIView):
         )
 
 
+# floorplan/management/__init__.py
+
+
+# floorplan/management/commands/export_floorplan_data.py
+# floorplan/management/commands/export_floorplan_data.py
+
+import csv
+import os
+import traceback
+
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Prefetch
+from django.utils import timezone  # Import timezone for formatting
+
+from floorplan.models import (
+    AllFloorsCsvRawRow,  # Using this for CSV 2 is much more efficient
+)
+from floorplan.models import (
+    AllFloorsData,
+    FloorPlan,
+    FloorPlanAnalysisResult,
+    TotalAreaData,
+)
+
+
+class Command(BaseCommand):
+    help = "Exports floorplan data into three separate CSV files, including analysis creation time."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--output-dir",
+            type=str,
+            default=".",  # Default to current directory
+            help="Directory where the CSV files will be saved.",
+        )
+
+    def handle(self, *args, **options):
+        output_dir = options["output_dir"]
+        os.makedirs(output_dir, exist_ok=True)  # Ensure directory exists
+
+        csv1_path = os.path.join(output_dir, "floorplan_summary_export.csv")
+        csv2_path = os.path.join(output_dir, "floorplan_room_details_export.csv")
+        csv3_path = os.path.join(output_dir, "floorplan_total_area_export.csv")
+
+        self.stdout.write(f"Starting export to directory: {output_dir}")
+
+        try:
+            self._export_csv1(csv1_path)
+            self._export_csv2(csv2_path)
+            self._export_csv3(csv3_path)
+            self.stdout.write(self.style.SUCCESS("Successfully exported all data."))
+        except Exception as e:
+            self.stderr.write(self.style.ERROR(f"An error occurred during export: {e}"))
+            traceback.print_exc()  # Print traceback for debugging
+            raise CommandError(f"Export failed. See traceback above for details.")
+
+    def _get_safe_value(self, obj, attribute_path, default=""):
+        """Safely retrieves nested attributes, returning default if any part is None."""
+        value = obj
+        try:
+            for attr in attribute_path.split("."):
+                if value is None:
+                    return default
+                value = getattr(value, attr)
+            return value if value is not None else default
+        except AttributeError:
+            return default
+
+    def _format_datetime(self, dt_obj, default=""):
+        """Formats a datetime object to ISO 8601 string, handling None."""
+        if dt_obj and hasattr(dt_obj, "isoformat"):
+            # Optional: Convert to local timezone if desired, otherwise uses stored timezone (likely UTC)
+            # return timezone.localtime(dt_obj).isoformat()
+            return dt_obj.isoformat()
+        return default
+
+    # === CSV 1 Export Logic ===
+    def _export_csv1(self, filepath):
+        self.stdout.write(f"Exporting CSV 1: Summary Data to {filepath}...")
+        headers = [
+            "property_id",
+            "user_id",
+            "floorplan_id",
+            "original_url",
+            "json_file_url",
+            "csv_url",
+            "total_area_csv_url",
+            "image_labelme_side_by_side_url",
+            "created_at",  # Changed header name
+        ]
+
+        queryset = AllFloorsData.objects.select_related(
+            "floor_plan__analysis_result"
+        ).all()
+
+        with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+
+            count = 0
+            for afd in queryset.iterator():
+                fp = self._get_safe_value(afd, "floor_plan")
+                analysis = self._get_safe_value(fp, "analysis_result")
+                analysis_time = self._get_safe_value(analysis, "created_at")
+
+                writer.writerow(
+                    [
+                        self._get_safe_value(analysis, "property_id"),
+                        self._get_safe_value(analysis, "user_id"),
+                        self._get_safe_value(fp, "floorplan_id"),
+                        self._get_safe_value(fp, "original_url"),
+                        self._get_safe_value(afd, "json_file_url"),
+                        self._get_safe_value(afd, "csv_url"),
+                        self._get_safe_value(afd, "total_area_csv_url"),
+                        self._get_safe_value(afd, "image_labelme_side_by_side_url"),
+                        self._format_datetime(
+                            analysis_time
+                        ),  # Data source remains the same
+                    ]
+                )
+                count += 1
+                if count % 1000 == 0:
+                    self.stdout.write(f"  ..processed {count} rows for CSV 1")
+
+        self.stdout.write(self.style.SUCCESS(f"Finished CSV 1: Exported {count} rows."))
+
+    # === CSV 2 Export Logic ===
+    def _export_csv2(self, filepath):
+        self.stdout.write(f"Exporting CSV 2: Room Detail Data to {filepath}...")
+        headers = [
+            "property_id",
+            "user_id",
+            "floorplan_id",
+            "floor_name",
+            "room_name",
+            "is_segment",
+            "dimensions_imperial",
+            "dimensions_metric",
+            "room_id",
+            "no_of_door",
+            "no_of_window",
+            "no_of_room_points",
+            "min_x_pixels",
+            "min_y_pixels",
+            "max_x_pixels",
+            "max_y_pixels",
+            "max_area_metric",
+            "max_area_imperial",
+            "max_area_pixels",
+            "actual_area_pixels",
+            "pixel_ratio",
+            "scale_metric",
+            "scale_imperial",
+            "calculated_sq_area_metric",
+            "calculated_floor_total_sq_area_metric",
+            "calculated_area_imperial",
+            "calculated_floor_total_sq_area_imperial",
+            "created_at",  # Changed header name
+        ]
+
+        queryset = AllFloorsCsvRawRow.objects.select_related(
+            "all_floors_data__floor_plan__analysis_result"
+        ).all()
+
+        with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+
+            count = 0
+            for row in queryset.iterator():
+                afd = self._get_safe_value(row, "all_floors_data")
+                fp = self._get_safe_value(afd, "floor_plan")
+                analysis = self._get_safe_value(fp, "analysis_result")
+                analysis_time = self._get_safe_value(analysis, "created_at")
+
+                writer.writerow(
+                    [
+                        self._get_safe_value(analysis, "property_id"),
+                        self._get_safe_value(analysis, "user_id"),
+                        self._get_safe_value(fp, "floorplan_id"),
+                        self._get_safe_value(row, "floor_name"),
+                        self._get_safe_value(row, "room_name"),
+                        self._get_safe_value(row, "is_segment"),
+                        self._get_safe_value(row, "dimensions_imperial"),
+                        self._get_safe_value(row, "dimensions_metric"),
+                        self._get_safe_value(row, "room_id"),
+                        self._get_safe_value(row, "no_of_door"),
+                        self._get_safe_value(row, "no_of_window"),
+                        self._get_safe_value(row, "no_of_room_points"),
+                        self._get_safe_value(row, "min_x_pixels"),
+                        self._get_safe_value(row, "min_y_pixels"),
+                        self._get_safe_value(row, "max_x_pixels"),
+                        self._get_safe_value(row, "max_y_pixels"),
+                        self._get_safe_value(row, "max_area_metric"),
+                        self._get_safe_value(row, "max_area_imperial"),
+                        self._get_safe_value(row, "max_area_pixels"),
+                        self._get_safe_value(row, "actual_area_pixels"),
+                        self._get_safe_value(row, "pixel_ratio"),
+                        self._get_safe_value(row, "scale_metric"),
+                        self._get_safe_value(row, "scale_imperial"),
+                        self._get_safe_value(row, "calculated_sq_area_metric"),
+                        self._get_safe_value(
+                            row, "calculated_floor_total_sq_area_metric"
+                        ),
+                        self._get_safe_value(row, "calculated_area_imperial"),
+                        self._get_safe_value(
+                            row, "calculated_floor_total_sq_area_imperial"
+                        ),
+                        self._format_datetime(
+                            analysis_time
+                        ),  # Data source remains the same
+                    ]
+                )
+                count += 1
+                if count % 5000 == 0:
+                    self.stdout.write(f"  ..processed {count} rows for CSV 2")
+
+        self.stdout.write(self.style.SUCCESS(f"Finished CSV 2: Exported {count} rows."))
+
+    # === CSV 3 Export Logic ===
+    def _export_csv3(self, filepath):
+        self.stdout.write(f"Exporting CSV 3: Total Area Data to {filepath}...")
+        headers = [
+            "property_id",
+            "user_id",
+            "floorplan_id",
+            "area_name",
+            "square_meters",
+            "square_feet",
+            "total_floors",
+            "total_named_rooms",
+            "total_segments",
+            "total_points",
+            "total_objects",
+            "total_door_objects",
+            "total_window_objects",
+            "total_stair_objects",
+            "list_of_objects",
+            "total_actual_pixels",
+            "metric_scale",
+            "imperial_scale",
+            "input_image_tokens",
+            "input_text_tokens",
+            "output_text_tokens",
+            "created_at",  # Changed header name
+        ]
+
+        queryset = TotalAreaData.objects.select_related(
+            "all_floors_data__floor_plan__analysis_result"
+        ).all()
+
+        with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+
+            count = 0
+            for tad in queryset.iterator():
+                afd = self._get_safe_value(tad, "all_floors_data")
+                fp = self._get_safe_value(afd, "floor_plan")
+                analysis = self._get_safe_value(fp, "analysis_result")
+                analysis_time = self._get_safe_value(analysis, "created_at")
+
+                writer.writerow(
+                    [
+                        self._get_safe_value(analysis, "property_id"),
+                        self._get_safe_value(analysis, "user_id"),
+                        self._get_safe_value(fp, "floorplan_id"),
+                        self._get_safe_value(tad, "area_name"),
+                        self._get_safe_value(tad, "square_meters"),
+                        self._get_safe_value(tad, "square_feet"),
+                        self._get_safe_value(tad, "total_floors"),
+                        self._get_safe_value(tad, "total_named_rooms"),
+                        self._get_safe_value(tad, "total_segments"),
+                        self._get_safe_value(tad, "total_points"),
+                        self._get_safe_value(tad, "total_objects"),
+                        self._get_safe_value(tad, "total_door_objects"),
+                        self._get_safe_value(tad, "total_window_objects"),
+                        self._get_safe_value(tad, "total_stair_objects"),
+                        self._get_safe_value(tad, "list_of_objects"),
+                        self._get_safe_value(tad, "total_actual_pixels"),
+                        self._get_safe_value(tad, "metric_scale"),
+                        self._get_safe_value(tad, "imperial_scale"),
+                        self._get_safe_value(tad, "input_image_tokens"),
+                        self._get_safe_value(tad, "input_text_tokens"),
+                        self._get_safe_value(tad, "output_text_tokens"),
+                        self._format_datetime(
+                            analysis_time
+                        ),  # Data source remains the same
+                    ]
+                )
+                count += 1
+                if count % 1000 == 0:
+                    self.stdout.write(f"  ..processed {count} rows for CSV 3")
+
+        self.stdout.write(self.style.SUCCESS(f"Finished CSV 3: Exported {count} rows."))
+
+
+# floorplan/management/commands/generate_analysis_report_csv.py
+# floorplan/management/commands/generate_analysis_report_csv.py
+
+import csv
+import logging
+
+from django.core.management.base import BaseCommand, CommandError
+
+# Import relevant models
+from floorplan.models import AllFloorsData, FloorPlan, FloorPlanAnalysisResult
+
+logger = logging.getLogger(__name__)
+
+
+class Command(BaseCommand):
+    help = "Generates a CSV report mapping original properties to their final AllFloors and TotalArea CSV URLs."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "input_csv_path",
+            type=str,
+            help="Path to the *original* input CSV file used for triggering analysis (to get the list of properties).",
+        )
+        parser.add_argument(
+            "output_report_csv_path",
+            type=str,
+            help="Path to save the final report CSV file.",
+        )
+        # Optional: Add filters if you don't want to use the input CSV
+        # parser.add_argument('--user-id', type=str, help='Filter report by User ID.')
+        # parser.add_argument('--property-id', type=str, help='Filter report by Property ID.')
+
+    def handle(self, *args, **options):
+        input_csv_path = options["input_csv_path"]
+        output_report_csv_path = options["output_report_csv_path"]
+
+        report_data = []
+        output_headers = [
+            "Property ID",
+            "User ID",
+            "Property URL",
+            "Original Floorplan URLs",
+            "Processed Floorplan Hash IDs",  # Added
+            "All Floors CSV URLs",
+            "Total Area CSV URLs",
+        ]
+        report_data.append(output_headers)
+
+        self.stdout.write(f"Reading property list from: {input_csv_path}")
+        self.stdout.write(f"Generating final report at: {output_report_csv_path}")
+
+        try:
+            with open(input_csv_path, mode="r", encoding="utf-8-sig") as infile:
+                reader = csv.DictReader(infile)
+                if not all(h in reader.fieldnames for h in ["Property ID", "User ID"]):
+                    raise CommandError(
+                        "Input CSV must contain at least 'Property ID' and 'User ID' columns."
+                    )
+
+                processed_properties = (
+                    set()
+                )  # To avoid duplicate lookups if input has duplicates
+
+                for i, row in enumerate(reader, start=2):
+                    property_id_csv = row.get("Property ID", "").strip()
+                    user_id_csv = row.get("User ID", "").strip()
+                    property_url_csv = row.get(
+                        "Property URL", ""
+                    ).strip()  # Original property URL
+                    original_fp_urls_csv = row.get(
+                        "Floorplan URLs", ""
+                    ).strip()  # Original list
+
+                    if not property_id_csv or not user_id_csv:
+                        self.stderr.write(
+                            self.style.WARNING(
+                                f"Skipping row {i} in input CSV: Missing Property ID or User ID."
+                            )
+                        )
+                        continue
+
+                    # Avoid reprocessing the same property_id/user_id combo
+                    property_key = (user_id_csv, property_id_csv)
+                    if property_key in processed_properties:
+                        continue
+                    processed_properties.add(property_key)
+
+                    self.stdout.write(
+                        f"Looking up results for User '{user_id_csv}', Property '{property_id_csv}'..."
+                    )
+
+                    all_floors_urls = []
+                    total_area_urls = []
+                    processed_fp_hashes = []
+
+                    try:
+                        # Find the analysis result
+                        analysis_result = FloorPlanAnalysisResult.objects.get(
+                            user_id=user_id_csv, property_id=property_id_csv
+                        )
+
+                        # Find all FloorPlan instances linked to this result
+                        floorplans = (
+                            FloorPlan.objects.filter(analysis_result=analysis_result)
+                            .select_related("all_floors_data")
+                            .order_by("id")
+                        )  # Fetch related data efficiently
+
+                        if not floorplans.exists():
+                            self.stderr.write(
+                                self.style.WARNING(
+                                    f"  No FloorPlan records found for {property_key}."
+                                )
+                            )
+                        else:
+                            self.stdout.write(
+                                f"  Found {floorplans.count()} processed floorplan(s)."
+                            )
+                            for fp in floorplans:
+                                processed_fp_hashes.append(
+                                    fp.floorplan_id
+                                )  # Store the hash ID
+                                try:
+                                    # Access related AllFloorsData (already fetched via select_related)
+                                    afd = fp.all_floors_data
+                                    if afd:
+                                        if afd.csv_url:
+                                            all_floors_urls.append(afd.csv_url)
+                                        if afd.total_area_csv_url:
+                                            total_area_urls.append(
+                                                afd.total_area_csv_url
+                                            )
+                                except AllFloorsData.DoesNotExist:
+                                    self.stderr.write(
+                                        self.style.WARNING(
+                                            f"    AllFloorsData missing for FloorPlan Hash {fp.floorplan_id}."
+                                        )
+                                    )
+                                except (
+                                    AttributeError
+                                ):  # Handle case where all_floors_data relation might not exist momentarily
+                                    self.stderr.write(
+                                        self.style.WARNING(
+                                            f"    Error accessing all_floors_data for FloorPlan Hash {fp.floorplan_id}."
+                                        )
+                                    )
+
+                    except FloorPlanAnalysisResult.DoesNotExist:
+                        self.stderr.write(
+                            self.style.WARNING(
+                                f"  No FloorPlanAnalysisResult found for User '{user_id_csv}', Property '{property_id_csv}'."
+                            )
+                        )
+                    except FloorPlanAnalysisResult.MultipleObjectsReturned:
+                        self.stderr.write(
+                            self.style.ERROR(
+                                f"  Multiple FloorPlanAnalysisResults found for User '{user_id_csv}', Property '{property_id_csv}'. Skipping."
+                            )
+                        )
+                    except Exception as e:
+                        self.stderr.write(
+                            self.style.ERROR(
+                                f"  Error querying data for {property_key}: {e}"
+                            )
+                        )
+
+                    # Add row to report data, joining lists with commas
+                    report_data.append(
+                        [
+                            property_id_csv,
+                            user_id_csv,
+                            property_url_csv,
+                            original_fp_urls_csv,
+                            ", ".join(processed_fp_hashes),
+                            ", ".join(all_floors_urls),
+                            ", ".join(total_area_urls),
+                        ]
+                    )
+
+        except FileNotFoundError:
+            raise CommandError(f"Input CSV file not found: {input_csv_path}")
+        except Exception as e:
+            logger.exception(
+                f"An unexpected error occurred reading input CSV or querying data: {e}"
+            )
+            raise CommandError(f"An unexpected error occurred: {e}")
+
+        # Write the final report CSV
+        try:
+            with open(
+                output_report_csv_path, mode="w", newline="", encoding="utf-8"
+            ) as outfile:
+                writer = csv.writer(outfile)
+                writer.writerows(report_data)
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Successfully generated analysis report: {output_report_csv_path}"
+                )
+            )
+        except IOError as e:
+            raise CommandError(
+                f"Error writing output report CSV file {output_report_csv_path}: {e}"
+            )
+
+
+# floorplan/management/commands/__init__.py
+
+
+# floorplan/management/commands/process_historical_data.py
+# floorplan/management/commands/process_historical_data.py
+
+import hashlib  # Needed if hashing URLs within command (e.g. finding)
+import logging
+import time
+
+from django.core.management.base import BaseCommand, CommandError
+from django.db import models, transaction
+
+# Import models from floorplan app
+from floorplan.models import (
+    AllFloorsCsvRawRow,
+    AllFloorsData,
+    CsvFloor,
+    CsvRoom,
+    FloorPlan,
+    FloorPlanAnalysisResult,
+)
+
+# Import the Celery task and backup utility
+from floorplan.tasks import process_floorplan_analysis
+from floorplan.utils.backup import backup_floorplan
+
+logger = logging.getLogger(__name__)
+# Configure logging level if needed, e.g.,
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
+class Command(BaseCommand):
+    help = """
+    Utilities for historical floorplan data:
+    1. (--backfill-raw): Backfills AllFloorsCsvRawRow from existing structured data
+       for existing FloorPlan records and triggers backup. Uses current data.
+    2. (--reanalyze): Triggers re-analysis task for EXISTING FloorPlan records based on
+       their stored original_url. NOTE: Webhook processing uses URL hash ID and will
+       UPDATE the corresponding FloorPlan record.
+    3. (--find-missing): Finds FloorPlanAnalysisResults WITHOUT linked FloorPlan records
+       and triggers analysis for them (attempts to create missing FloorPlans).
+       Requires logic to find the original URL.
+
+    USE WITH CAUTION - Re-analysis can cause high load. Test with limits/filters.
+    """
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--backfill-raw",
+            action="store_true",
+            help="Backfill AllFloorsCsvRawRow for existing FloorPlans and trigger backup.",
+        )
+        parser.add_argument(
+            "--reanalyze",
+            action="store_true",
+            help="Trigger re-analysis task for EXISTING FloorPlan records (should update).",
+        )
+        parser.add_argument(
+            "--find-missing",
+            action="store_true",
+            help="Find AnalysisResults without FloorPlans and trigger analysis for them.",
+        )
+        parser.add_argument(
+            "--floorplan-id",
+            type=str,
+            help="(For --backfill-raw / --reanalyze) Process only a specific existing FloorPlan Hash ID.",
+        )
+        parser.add_argument(
+            "--user-id",
+            type=str,
+            help="Filter by User ID (applies to all modes).",
+        )
+        parser.add_argument(
+            "--property-id",
+            type=str,
+            help="Filter by Property ID (requires --user-id, applies to all modes).",
+        )
+        parser.add_argument(
+            "--analysis-result-id",
+            type=int,
+            help="(For --find-missing) Process only a specific FloorPlanAnalysisResult PK.",
+        )
+        parser.add_argument(
+            "--limit",
+            type=int,
+            help="Limit the number of items (FloorPlans or AnalysisResults) to process.",
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=2.0,
+            help="Delay in seconds between triggering re-analysis tasks (default: 2.0).",
+        )
+        parser.add_argument(
+            "--start-index",
+            type=int,
+            default=0,
+            help="Start processing from this index (0-based) in the queryset (useful for resuming).",
+        )
+        parser.add_argument(
+            "--batch-size",
+            type=int,
+            default=100,
+            help="Log progress message every N items processed.",
+        )
+
+    def handle(self, *args, **options):
+        backfill = options["backfill_raw"]
+        reanalyze = options["reanalyze"]
+        find_missing = options["find_missing"]
+        fp_id_filter = options["floorplan_id"]
+        user_id_filter = options["user_id"]
+        prop_id_filter = options["property_id"]
+        ar_id_filter = options["analysis_result_id"]
+        limit = options["limit"]
+        delay = options["delay"]
+        start_index = options["start_index"]
+        batch_size = options["batch_size"]
+
+        # --- Argument Validation ---
+        if not backfill and not reanalyze and not find_missing:
+            raise CommandError(
+                "Specify at least one action: --backfill-raw, --reanalyze, or --find-missing."
+            )
+        if prop_id_filter and not user_id_filter:
+            raise CommandError("--property-id requires --user-id.")
+        if fp_id_filter and find_missing:
+            raise CommandError("--floorplan-id cannot be used with --find-missing.")
+        if ar_id_filter and (backfill or reanalyze):
+            raise CommandError(
+                "--analysis-result-id can only be used with --find-missing."
+            )
+
+        # --- Initialize Counters ---
+        processed_count_fp = 0
+        processed_count_missing = 0
+        errors_backfill = 0
+        errors_backup = 0
+        errors_reanalyze_existing = 0
+        errors_reanalyze_missing = 0
+
+        # --- Mode 1 & 2: Process EXISTING FloorPlans ---
+        if backfill or reanalyze:
+            self.stdout.write(
+                self.style.MIGRATE_HEADING(
+                    "Processing Existing FloorPlans (--backfill-raw / --reanalyze)"
+                )
+            )
+            queryset_fp = self._get_filtered_floorplan_queryset(
+                fp_id_filter, user_id_filter, prop_id_filter
+            )
+            total_fp_count = queryset_fp.count()
+            self.stdout.write(
+                f"Found {total_fp_count} existing FloorPlan(s) matching criteria."
+            )
+
+            effective_fp_count = self._apply_limit_offset(
+                total_fp_count, limit, start_index
+            )
+            if effective_fp_count <= 0:
+                self.stdout.write(
+                    "No existing floorplans to process with current limit/start_index."
+                )
+            else:
+                self.stdout.write(
+                    f"Processing {effective_fp_count} FloorPlan(s) starting from index {start_index}..."
+                )
+                # Apply slicing only before iteration
+                queryset_fp_limited = queryset_fp[
+                    start_index : start_index + effective_fp_count
+                ]
+
+                for i, floor_plan in enumerate(queryset_fp_limited, start=start_index):
+                    current_index = i
+                    processed_count_fp += 1
+                    self.stdout.write(
+                        f"\n--- Processing FP {processed_count_fp}/{effective_fp_count} (Index:{current_index}, Hash:{floor_plan.floorplan_id}, PK:{floor_plan.pk}) ---"
+                    )
+
+                    if not self._check_analysis_result(floor_plan):
+                        continue
+
+                    # -- Backfill --
+                    if backfill:
+                        errors_b, errors_bk = self._run_backfill_and_backup(floor_plan)
+                        errors_backfill += errors_b
+                        errors_backup += errors_bk
+
+                    # -- Reanalyze Existing --
+                    if reanalyze:
+                        errors_reanalyze_existing += self._run_reanalyze_existing(
+                            floor_plan, delay
+                        )
+
+                    if processed_count_fp > 0 and processed_count_fp % batch_size == 0:
+                        self.stdout.write(
+                            f"--- Processed batch ending at index {current_index} ---"
+                        )
+
+        # --- Mode 3: Find Missing FloorPlans and Reanalyze ---
+        if find_missing:
+            self.stdout.write(
+                self.style.MIGRATE_HEADING(
+                    "\nFinding AnalysisResults Missing FloorPlans (--find-missing)"
+                )
+            )
+            queryset_missing = self._get_filtered_missing_queryset(
+                ar_id_filter, user_id_filter, prop_id_filter
+            )
+            total_missing_count = queryset_missing.count()
+            self.stdout.write(
+                f"Found {total_missing_count} AnalysisResult(s) missing FloorPlans matching criteria."
+            )
+
+            effective_missing_count = self._apply_limit_offset(
+                total_missing_count, limit, start_index
+            )
+            if effective_missing_count <= 0:
+                self.stdout.write(
+                    "No missing floorplans to process with current limit/start_index."
+                )
+            else:
+                self.stdout.write(
+                    f"Processing {effective_missing_count} AnalysisResult(s) starting from index {start_index}..."
+                )
+                # Apply slicing only before iteration
+                queryset_missing_limited = queryset_missing[
+                    start_index : start_index + effective_missing_count
+                ]
+
+                for i, analysis_result in enumerate(
+                    queryset_missing_limited, start=start_index
+                ):
+                    current_index = i
+                    processed_count_missing += 1
+                    self.stdout.write(
+                        f"\n--- Processing Missing FP {processed_count_missing}/{effective_missing_count} (Index:{current_index}, AR PK:{analysis_result.pk}) ---"
+                    )
+
+                    errors_reanalyze_missing += self._run_reanalyze_missing(
+                        analysis_result, delay
+                    )
+
+                    if (
+                        processed_count_missing > 0
+                        and processed_count_missing % batch_size == 0
+                    ):
+                        self.stdout.write(
+                            f"--- Processed batch ending at index {current_index} ---"
+                        )
+
+        # --- Final Summary ---
+        self._print_summary(
+            backfill,
+            reanalyze,
+            find_missing,
+            processed_count_fp,
+            processed_count_missing,
+            errors_backfill,
+            errors_backup,
+            errors_reanalyze_existing,
+            errors_reanalyze_missing,
+        )
+
+    # --- Helper Methods for Querying and Actions ---
+
+    def _get_filtered_floorplan_queryset(
+        self, fp_id_filter, user_id_filter, prop_id_filter
+    ):
+        """Builds and filters the queryset for existing FloorPlans."""
+        queryset = (
+            FloorPlan.objects.select_related("analysis_result", "all_floors_data")
+            .prefetch_related(  # Keep prefetches needed for backfill
+                "all_floors_data__csv_floors__rooms__pixel_data",
+                "all_floors_data__csv_floors__rooms__dimensions",
+                "all_floors_data__csv_floors__rooms__scaling_factors",
+            )
+            .order_by("id")
+        )
+
+        if fp_id_filter:
+            self.stdout.write(f"Filtering for FloorPlan Hash ID: {fp_id_filter}")
+            queryset = queryset.filter(floorplan_id=fp_id_filter)
+        elif user_id_filter:
+            self.stdout.write(f"Filtering for User ID: {user_id_filter}")
+            queryset = queryset.filter(analysis_result__user_id=user_id_filter)
+            if prop_id_filter:
+                self.stdout.write(f"Filtering for Property ID: {prop_id_filter}")
+                queryset = queryset.filter(analysis_result__property_id=prop_id_filter)
+        return queryset
+
+    def _get_filtered_missing_queryset(
+        self, ar_id_filter, user_id_filter, prop_id_filter
+    ):
+        """Builds and filters the queryset for missing FloorPlans (via AnalysisResult)."""
+        results_with_fp = FloorPlan.objects.values_list(
+            "analysis_result_id", flat=True
+        ).distinct()
+        queryset = FloorPlanAnalysisResult.objects.exclude(
+            id__in=results_with_fp
+        ).order_by("id")
+
+        if ar_id_filter:
+            self.stdout.write(f"Filtering for AnalysisResult PK: {ar_id_filter}")
+            queryset = queryset.filter(pk=ar_id_filter)
+        elif user_id_filter:
+            self.stdout.write(f"Filtering for User ID: {user_id_filter}")
+            queryset = queryset.filter(user_id=user_id_filter)
+            if prop_id_filter:
+                self.stdout.write(f"Filtering for Property ID: {prop_id_filter}")
+                queryset = queryset.filter(property_id=prop_id_filter)
+        return queryset
+
+    def _apply_limit_offset(self, total_count, limit, start_index):
+        """Helper to calculate effective count after limit/offset."""
+        if start_index >= total_count:
+            return 0
+        effective_count = total_count - start_index
+        if limit is not None:
+            effective_count = min(limit, effective_count)
+        return effective_count if effective_count > 0 else 0
+
+    def _check_analysis_result(self, floor_plan):
+        """Checks if the floorplan has a valid analysis result."""
+        if not hasattr(floor_plan, "analysis_result") or not floor_plan.analysis_result:
+            self.stderr.write(
+                self.style.WARNING(
+                    f"Skipping FloorPlan {floor_plan.pk}: Missing AnalysisResult relation."
+                )
+            )
+            return False
+        return True
+
+    def _run_backfill_and_backup(self, floor_plan):
+        """Runs backfill and triggers backup for a single floorplan."""
+        backfill_error_count = 0
+        backup_error_count = 0
+        if hasattr(floor_plan, "all_floors_data") and floor_plan.all_floors_data:
+            self.stdout.write(f"  Attempting to backfill raw rows...")
+            try:
+                with transaction.atomic():
+                    raw_rows_count = self._backfill_raw_data(floor_plan.all_floors_data)
+                self.stdout.write(
+                    self.style.SUCCESS(
+                        f"  Backfill completed. Created/Updated {raw_rows_count} raw rows."
+                    )
+                )
+                # Trigger Backup only after successful backfill
+                self.stdout.write(f"  Triggering backup...")
+                try:
+                    backup_floorplan(floor_plan)
+                    self.stdout.write(
+                        self.style.SUCCESS(f"  Backup triggered successfully.")
+                    )
+                except Exception as backup_exc:
+                    backup_error_count = 1
+                    self.stderr.write(
+                        self.style.ERROR(f"  ERROR triggering backup: {backup_exc}")
+                    )
+            except Exception as backfill_exc:
+                backfill_error_count = 1
+                self.stderr.write(
+                    self.style.ERROR(f"  ERROR during backfill: {backfill_exc}")
+                )
+        else:
+            self.stderr.write(
+                self.style.WARNING(f"  Skipping backfill: Missing AllFloorsData.")
+            )
+        return backfill_error_count, backup_error_count
+
+    def _run_reanalyze_existing(self, floor_plan, delay):
+        """Triggers reanalysis for an existing floorplan."""
+        error_count = 0
+        self.stdout.write(f"  Triggering re-analysis task (will update existing)...")
+        try:
+            if not floor_plan.original_url:
+                raise ValueError("Missing original_url, cannot reanalyze.")
+            fp_payload = {
+                "reanalysis_key": {"url": floor_plan.original_url, "notes": ""}
+            }
+            process_floorplan_analysis.delay(
+                floor_plan.analysis_result.user_id,
+                floor_plan.analysis_result.property_id,
+                fp_payload,
+            )
+            self.stdout.write(
+                self.style.SUCCESS(f"  Re-analysis task queued successfully.")
+            )
+            if delay > 0:
+                self.stdout.write(f"  Pausing for {delay} seconds...")
+                time.sleep(delay)
+        except Exception as reanalyze_exc:
+            error_count = 1
+            self.stderr.write(
+                self.style.ERROR(f"  ERROR triggering re-analysis: {reanalyze_exc}")
+            )
+        return error_count
+
+    def _run_reanalyze_missing(self, analysis_result, delay):
+        """Triggers analysis for an AnalysisResult missing a FloorPlan."""
+        error_count = 0
+        original_url = self._find_original_url(analysis_result)
+
+        if not original_url:
+            self.stderr.write(
+                self.style.WARNING(
+                    "  Cannot trigger analysis - Original image URL could not be determined."
+                )
+            )
+            error_count = 1
+        else:
+            self.stdout.write(f"  Triggering analysis task for URL: {original_url}")
+            try:
+                fp_payload = {"floorplan_0": {"url": original_url, "notes": ""}}
+                process_floorplan_analysis.delay(
+                    analysis_result.user_id, analysis_result.property_id, fp_payload
+                )
+                self.stdout.write(
+                    self.style.SUCCESS(f"  Analysis task queued successfully.")
+                )
+                if delay > 0:
+                    self.stdout.write(f"  Pausing for {delay} seconds...")
+                    time.sleep(delay)
+            except Exception as reanalyze_exc:
+                error_count = 1
+                self.stderr.write(
+                    self.style.ERROR(f"  ERROR triggering analysis: {reanalyze_exc}")
+                )
+        return error_count
+
+    def _backfill_raw_data(self, all_floors_data):
+        """
+        Internal logic for backfilling raw rows for one AllFloorsData.
+        Clears old rows first, then bulk creates new ones.
+        Returns count of created rows.
+        """
+        count = 0
+        # Delete existing raw rows first to ensure clean state
+        deleted_count, _ = all_floors_data.all_floors_raw_rows.all().delete()
+        if deleted_count > 0:
+            logger.debug(
+                f"Deleted {deleted_count} old raw rows for AFD {all_floors_data.pk} before backfill."
+            )
+
+        csv_floors = all_floors_data.csv_floors.prefetch_related(
+            "rooms__pixel_data", "rooms__dimensions", "rooms__scaling_factors"
+        ).all()
+
+        if not csv_floors:
+            return 0
+
+        rows_to_create = []
+        for csv_floor in csv_floors:
+            # ... (logic to iterate rooms and build raw_data dict remains the same) ...
+            floor_name = csv_floor.floor_name
+            floor_total_metric = csv_floor.calculated_total_area_metric
+            floor_total_imperial = csv_floor.calculated_total_area_imperial
+            for room in csv_floor.rooms.all():
+                if room.room_id is None:
+                    self.stderr.write(
+                        self.style.WARNING(
+                            f"    Skipping raw row backfill for Room PK {room.pk} due to missing room_id."
+                        )
+                    )
+                    continue  # Skip rooms without a room_id
+
+                pixel_data = getattr(room, "pixel_data", None)
+                dimensions = getattr(room, "dimensions", None)
+                scaling = getattr(room, "scaling_factors", None)
+                raw_data = {
+                    "all_floors_data_id": all_floors_data.pk,  # Use ID for bulk create instance
+                    "floor_name": floor_name,
+                    "room_name": room.room_name,
+                    "is_segment": room.is_segment,
+                    "room_id": room.room_id,
+                    "no_of_door": room.no_of_doors,
+                    "no_of_window": room.no_of_windows,
+                    "no_of_room_points": room.no_of_room_points,
+                    "min_x_pixels": getattr(pixel_data, "min_x_pixels", None),
+                    "min_y_pixels": getattr(pixel_data, "min_y_pixels", None),
+                    "max_x_pixels": getattr(pixel_data, "max_x_pixels", None),
+                    "max_y_pixels": getattr(pixel_data, "max_y_pixels", None),
+                    "max_area_pixels": getattr(pixel_data, "max_area_pixels", None),
+                    "actual_area_pixels": getattr(
+                        pixel_data, "actual_area_pixels", None
+                    ),
+                    "pixel_ratio": getattr(pixel_data, "pixel_ratio", None),
+                    "dimensions_imperial": getattr(
+                        dimensions, "dimensions_imperial", None
+                    ),
+                    "dimensions_metric": getattr(dimensions, "dimensions_metric", None),
+                    "max_area_metric": getattr(dimensions, "max_area_metric", None),
+                    "max_area_imperial": getattr(dimensions, "max_area_imperial", None),
+                    "calculated_sq_area_metric": getattr(
+                        dimensions, "calculated_sq_area_metric", None
+                    ),
+                    "calculated_area_imperial": getattr(
+                        dimensions, "calculated_area_imperial", None
+                    ),
+                    "scale_metric": getattr(scaling, "scale_metric", None),
+                    "scale_imperial": getattr(scaling, "scale_imperial", None),
+                    "calculated_floor_total_sq_area_metric": floor_total_metric,
+                    "calculated_floor_total_sq_area_imperial": floor_total_imperial,
+                }
+                rows_to_create.append(AllFloorsCsvRawRow(**raw_data))
+
+        if rows_to_create:
+            created_objs = AllFloorsCsvRawRow.objects.bulk_create(rows_to_create)
+            count = len(created_objs)
+
+        return count
+
+    def _find_original_url(self, analysis_result):
+        """
+        Placeholder function - IMPLEMENT THIS LOGIC.
+        Finds the original image URL associated with a FloorPlanAnalysisResult.
+        """
+        self.stderr.write(
+            self.style.NOTICE(
+                f"    Attempting to find original URL for AnalysisResult PK {analysis_result.pk}"
+            )
+        )
+        # --- Example Logic (Requires Adjustment & History) ---
+        try:
+            historical_fps = (
+                FloorPlan.history.filter(analysis_result_id=analysis_result.pk)
+                .exclude(original_url__isnull=True)
+                .exclude(original_url__exact="")
+                .order_by("-history_date")
+            )  # Get the most recent known URL
+            if historical_fps.exists():
+                found_url = historical_fps.first().original_url
+                self.stdout.write(
+                    f"      Found URL from FloorPlan history: {found_url}"
+                )
+                return found_url
+        except AttributeError:
+            self.stderr.write(
+                self.style.WARNING(
+                    "      History not enabled on FloorPlan model or model removed."
+                )
+            )
+        except Exception as e:
+            self.stderr.write(
+                self.style.WARNING(f"      Error querying FloorPlan history: {e}")
+            )
+        # --- Add other lookup methods here if possible ---
+        # e.g., check a related Property model
+        self.stderr.write(
+            self.style.ERROR(
+                "      Could not determine original URL. IMPLEMENT FIND LOGIC in management command!"
+            )
+        )
+        return None
+
+    def _print_summary(
+        self,
+        backfill,
+        reanalyze,
+        find_missing,
+        processed_fp,
+        processed_missing,
+        errors_bf,
+        errors_bk,
+        errors_re_exist,
+        errors_re_miss,
+    ):
+        """Prints the final summary report."""
+        self.stdout.write(f"\n--- Processing Summary ---")
+        if backfill or reanalyze:
+            self.stdout.write(f"Total Existing FloorPlans processed: {processed_fp}")
+            if backfill:
+                self.stdout.write(f"  Backfill errors: {errors_bf}")
+                self.stdout.write(f"  Backup trigger errors: {errors_bk}")
+            if reanalyze:
+                self.stdout.write(
+                    f"  Re-analysis (existing FP) trigger errors: {errors_re_exist}"
+                )
+        if find_missing:
+            self.stdout.write(
+                f"Total Missing FloorPlans processed (AnalysisResults): {processed_missing}"
+            )
+            self.stdout.write(
+                f"  Re-analysis (missing FP) trigger errors: {errors_re_miss}"
+            )
+        self.stdout.write(self.style.SUCCESS("Command finished."))
+
+
+# floorplan/management/commands/floorplan_stats.py
+from django.core.management.base import BaseCommand
+from django.db.models import Count, Max, Min, Q  # Import Min, Max
+
+# Import models from the floorplan app
+try:
+    from floorplan.models import AllFloorsData, FloorPlanAnalysisResult
+except ImportError:
+    from ..models import AllFloorsData, FloorPlanAnalysisResult
+
+
+class Command(BaseCommand):
+    help = "Displays statistics about AI Floorplan Analysis results."
+
+    def handle(self, *args, **options):
+        self.stdout.write("Calculating Floorplan Analysis Statistics...")
+        self.stdout.write("-" * 20)
+
+        # --- Timestamps (Based on FloorPlanAnalysisResult) ---
+        # Note: FloorPlanAnalysisResult only has created_at, not updated_at
+        timestamps = FloorPlanAnalysisResult.objects.aggregate(
+            first_created=Min("created_at"),
+            last_created=Max("created_at"),
+            # No last_updated field on this model
+        )
+        first_created = timestamps.get("first_created") or "N/A"
+        last_created = timestamps.get("last_created") or "N/A"
+        self.stdout.write(f"- First Analysis Result Created: {first_created}")
+        self.stdout.write(f"- Last Analysis Result Created:  {last_created}")
+        # self.stdout.write(f"- Last Analysis Result Updated: N/A") # Or omit
+        self.stdout.write("-" * 20)
+
+        # --- Counts ---
+        # 1. Properties with *any* AI Floorplan Analysis Result
+        any_analysis_count = (
+            FloorPlanAnalysisResult.objects.values("property_id").distinct().count()
+        )
+        self.stdout.write(
+            f"- Properties with an AI Floorplan Analysis Result: {any_analysis_count}"
+        )
+
+        # 2. Properties with Analysis + all_floors.csv URL
+        with_all_floors_csv_count = (
+            FloorPlanAnalysisResult.objects.filter(
+                floor_plans__all_floors_data__isnull=False
+            )
+            .exclude(
+                Q(floor_plans__all_floors_data__csv_url__isnull=True)
+                | Q(floor_plans__all_floors_data__csv_url="")
+            )
+            .distinct()
+            .count()
+        )
+        self.stdout.write(
+            f"- Properties with Analysis AND all_floors.csv URL: {with_all_floors_csv_count}"
+        )
+
+        # 3. Properties with Analysis + total_area.csv URL
+        with_total_area_csv_count = (
+            FloorPlanAnalysisResult.objects.filter(
+                floor_plans__all_floors_data__isnull=False
+            )
+            .exclude(
+                Q(floor_plans__all_floors_data__total_area_csv_url__isnull=True)
+                | Q(floor_plans__all_floors_data__total_area_csv_url="")
+            )
+            .distinct()
+            .count()
+        )
+        self.stdout.write(
+            f"- Properties with Analysis AND total_area.csv URL: {with_total_area_csv_count}"
+        )
+
+        # 4. Properties with Analysis + AllFloorsCsvRawRow data
+        with_raw_rows_count = (
+            FloorPlanAnalysisResult.objects.filter(
+                floor_plans__all_floors_data__all_floors_raw_rows__isnull=False
+            )
+            .distinct()
+            .count()
+        )
+        self.stdout.write(
+            f"- Properties with Analysis AND AllFloorsCsvRawRow data: {with_raw_rows_count}"
+        )
+
+        # --- Final Summary ---
+        self.stdout.write("-" * 20)
+        self.stdout.write(
+            self.style.SUCCESS("Finished calculating floorplan statistics.")
+        )
+        # (You can optionally repeat the numbers here if desired)
+
+
+# floorplan/management/commands/generate_floorplan_report.py
+# floorplan/management/commands/generate_floorplan_report.py
+
+import csv
+import logging
+from decimal import (
+    Decimal,  # Although using FloatField now, Decimal might be needed elsewhere
+)
+
+from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Count, FloatField, Sum, Value  # Import FloatField
+from django.db.models.functions import Coalesce  # Handle potential Null sums
+
+# Import models from floorplan app
+from floorplan.models import (
+    AllFloorsCsvRawRow,
+    AllFloorsData,
+    FloorPlan,
+    FloorPlanAnalysisResult,
+    TotalAreaData,
+)
+
+# Use standard Django logging
+logger = logging.getLogger(__name__)
+# Example: Configure basic logging if not handled elsewhere in Django settings
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
+# Define column layout constants
+TOTAL_AREA_COL_COUNT = 5  # Number of columns used by Total Area section (Area Name, SqM, SqFt, Floor#, Seg#)
+ALL_FLOORS_HEADER_START_COL = 6  # Column index (0-based) where AllFloors headers start
+
+
+class Command(BaseCommand):
+    help = """
+    Generates a CSV report combining TotalAreaData and AllFloorsCsvRawRow data.
+    If --user-id and --property-id are provided, filters data for that specific analysis.
+    Otherwise, generates a report including ALL data from the relevant tables.
+    """
+
+    def add_arguments(self, parser):
+        # Make user_id and property_id optional flags
+        parser.add_argument(
+            "--user-id",
+            type=str,
+            help="(Optional) Filter report for a specific User ID.",
+        )
+        parser.add_argument(
+            "--property-id",
+            type=str,
+            help="(Optional) Filter report for a specific Property ID (requires --user-id).",
+        )
+        parser.add_argument(
+            "--floorplan-id",
+            type=str,
+            help="(Optional) Filter report for a specific FloorPlan Hash ID (requires --user-id and --property-id).",
+        )
+        # Output file remains positional and required
+        parser.add_argument(
+            "output_file", type=str, help="Path to the output CSV file."
+        )
+
+    def handle(self, *args, **options):
+        user_id_filter = options["user_id"]
+        property_id_filter = options["property_id"]
+        floorplan_id_filter = options["floorplan_id"]
+        output_file = options["output_file"]
+
+        # --- Input Validation ---
+        if property_id_filter and not user_id_filter:
+            raise CommandError("--property-id requires --user-id to be specified.")
+        if floorplan_id_filter and not (user_id_filter and property_id_filter):
+            raise CommandError(
+                "--floorplan-id requires both --user-id and --property-id."
+            )
+
+        # --- Determine Query Scope ---
+        all_floors_data_ids = None
+        report_scope = "GLOBAL"
+
+        if user_id_filter and property_id_filter:
+            report_scope = f"User: {user_id_filter}, Property: {property_id_filter}"
+            try:
+                # Find the single AnalysisResult matching the user/property
+                analysis_result = FloorPlanAnalysisResult.objects.get(
+                    user_id=user_id_filter, property_id=property_id_filter
+                )
+                self.stdout.write(
+                    f"Found AnalysisResult PK: {analysis_result.pk} for specified filters."
+                )
+
+                # Find FloorPlan(s) linked to this AnalysisResult
+                floorplans_qs = FloorPlan.objects.filter(
+                    analysis_result=analysis_result
+                )
+                if floorplan_id_filter:
+                    report_scope += f", FloorPlan: {floorplan_id_filter}"
+                    floorplans_qs = floorplans_qs.filter(
+                        floorplan_id=floorplan_id_filter
+                    )
+                    self.stdout.write(
+                        f"Filtering for FloorPlan Hash ID: {floorplan_id_filter}"
+                    )
+
+                floorplan_pks = list(floorplans_qs.values_list("pk", flat=True))
+                if not floorplan_pks:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"No FloorPlan records found matching the specified criteria. Report may be incomplete."
+                        )
+                    )
+                    all_floors_data_ids = []  # Ensure queries below get empty results
+                else:
+                    self.stdout.write(
+                        f"Found {len(floorplan_pks)} FloorPlan(s) for this analysis."
+                    )
+                    # Get AllFloorsData IDs associated with the found FloorPlan(s)
+                    all_floors_data_ids = list(
+                        AllFloorsData.objects.filter(
+                            floor_plan_id__in=floorplan_pks
+                        ).values_list("id", flat=True)
+                    )
+
+            except FloorPlanAnalysisResult.DoesNotExist:
+                raise CommandError(
+                    f"No FloorPlanAnalysisResult found for User '{user_id_filter}', Property '{property_id_filter}'."
+                )
+            except FloorPlanAnalysisResult.MultipleObjectsReturned:
+                raise CommandError(
+                    f"Multiple FloorPlanAnalysisResult found for User '{user_id_filter}', Property '{property_id_filter}'. Cannot generate specific report."
+                )
+        else:
+            self.stdout.write(
+                "No user/property filters provided. Generating GLOBAL report."
+            )
+            # For global report, all_floors_data_ids remains None, queries will use .all()
+
+        # --- Query Data Based on Scope ---
+        if all_floors_data_ids is not None:  # Filtered scope
+            if not all_floors_data_ids:  # No matching AllFloorsData found
+                total_area_data_qs = TotalAreaData.objects.none()
+                raw_rows_data_qs = AllFloorsCsvRawRow.objects.none()
+                self.stdout.write(
+                    self.style.WARNING(
+                        "No AllFloorsData found for the selected FloorPlan(s). Report will only contain headers."
+                    )
+                )
+            else:
+                total_area_data_qs = TotalAreaData.objects.filter(
+                    all_floors_data_id__in=all_floors_data_ids
+                ).order_by(
+                    "all_floors_data_id", "area_name"
+                )  # Order by AFD id first
+                raw_rows_data_qs = (
+                    AllFloorsCsvRawRow.objects.filter(
+                        all_floors_data_id__in=all_floors_data_ids
+                    )
+                    .select_related("all_floors_data__floor_plan")
+                    .order_by("all_floors_data_id", "floor_name", "room_id")
+                )  # Order by AFD id first
+        else:  # Global scope
+            total_area_data_qs = TotalAreaData.objects.all().order_by(
+                "all_floors_data_id", "area_name"
+            )
+            raw_rows_data_qs = (
+                AllFloorsCsvRawRow.objects.all()
+                .select_related("all_floors_data__floor_plan")
+                .order_by("all_floors_data_id", "floor_name", "room_id")
+            )
+
+        total_area_count = total_area_data_qs.count()
+        raw_rows_count = raw_rows_data_qs.count()
+        self.stdout.write(
+            f"Processing {total_area_count} Total Area records and {raw_rows_count} Raw Floorplan Rows for scope: {report_scope}"
+        )
+
+        # --- Calculate Totals Based on Query Scope ---
+        totals_agg = total_area_data_qs.exclude(
+            area_name__iregex=r"^Total Floor Area.*"  # Exclude summary rows from sum
+        ).aggregate(
+            # Explicitly set output_field to FloatField
+            total_sq_meters=Coalesce(
+                Sum("square_meters", output_field=FloatField()),
+                Value(0.0, output_field=FloatField()),  # Use Value(0.0) with FloatField
+            ),
+            total_sq_feet=Coalesce(
+                Sum("square_feet", output_field=FloatField()),
+                Value(0.0, output_field=FloatField()),  # Use Value(0.0) with FloatField
+            ),
+        )
+        # Calculate distinct floors and total segments from Raw Rows based on the same scope
+        raw_agg = raw_rows_data_qs.aggregate(
+            distinct_floor_count=Count("floor_name", distinct=True),
+            total_segments=Count("id"),  # Count all raw rows as segments/rooms
+        )
+
+        # --- Prepare Headers ---
+        # Define headers exactly as needed for the output, including empty placeholders
+        # Ensure this matches the fields populated in the writing loops below
+        headers = [
+            "Area name",  # Col 0
+            "Total Area Sq Meters",  # Col 1
+            "Total Area Sq Feet",  # Col 2
+            "Total Area Floor Count",  # Col 3
+            "Total Area Segment Count",  # Col 4
+            "",  # Col 5 (Empty spacer)
+            "All Floors Floor_Name",  # Col 6
+            "All Floors Room_Name",  # Col 7
+            "All Floors is_segment",  # Col 8
+            "All Floors Room_id",  # Col 9
+            "All Floors No_of_door",  # Col 10
+            "All Floors No_of_window",  # Col 11
+            "All Floors No_of_room_points",  # Col 12
+            "All Floors Min X Pixels",  # Col 13
+            "All Floors Min Y Pixels",  # Col 14
+            "All Floors Max X Pixels",  # Col 15
+            "All Floors Max Y Pixels",  # Col 16
+            "dimensions_imperial",  # Col 17
+            "dimensions_metric",  # Col 18
+            "max_area_metric",  # Col 19
+            "max_area_imperial",  # Col 20
+            "max_area_pixels",  # Col 21
+            "actual_area_pixels",  # Col 22
+            "pixel_ratio",  # Col 23
+            "scale_metric",  # Col 24
+            "scale_imperial",  # Col 25
+            "calculated_sq_area_metric",  # Col 26
+            "calculated_floor_total_sq_area_metric",  # Col 27
+            "calculated_area_imperial",  # Col 28
+            "calculated_floor_total_sq_area_imperial",  # Col 29
+        ]
+        num_headers = len(headers)  # Get total number of columns
+
+        # --- Write to CSV ---
+        self.stdout.write(f"Writing report to {output_file}...")
+        try:
+            with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile)
+
+                # --- Write Header Row ---
+                writer.writerow(headers)
+
+                # --- Write Total Area Data Detail Rows ---
+                total_area_rows_written = 0
+                # Use iterator to avoid loading all into memory if very large
+                for area_record in total_area_data_qs.iterator():
+                    # Only write detail rows here, exclude summary-like rows if present
+                    if (
+                        not area_record.area_name
+                        or not area_record.area_name.lower().startswith(
+                            "total floor area"
+                        )
+                    ):
+                        row_data = [
+                            ""
+                        ] * num_headers  # Initialize empty row of correct length
+                        row_data[0] = area_record.area_name
+                        row_data[1] = (
+                            f"{area_record.square_meters:.2f}"
+                            if area_record.square_meters is not None
+                            else ""
+                        )
+                        row_data[2] = (
+                            f"{area_record.square_feet:.2f}"
+                            if area_record.square_feet is not None
+                            else ""
+                        )  # Format as float
+                        # Populate cols 3 & 4 if TotalAreaData has relevant fields
+                        # Example: fetch counts if needed per area_record
+                        # row_data[3] = area_record.total_floors if hasattr(area_record,'total_floors') and area_record.total_floors is not None else ""
+                        # row_data[4] = area_record.total_segments if hasattr(area_record,'total_segments') and area_record.total_segments is not None else ""
+                        writer.writerow(row_data)
+                        total_area_rows_written += 1
+
+                # --- Write Overall Total Row ---
+                total_row = [""] * num_headers
+                total_row[0] = (
+                    "Total Floor Area (Query Scope)"  # Label for the total row
+                )
+                total_row[1] = f"{totals_agg['total_sq_meters']:.2f}"
+                total_row[2] = f"{totals_agg['total_sq_feet']:.2f}"  # Format as float
+                total_row[3] = raw_agg[
+                    "distinct_floor_count"
+                ]  # Put counts in total row
+                total_row[4] = raw_agg["total_segments"]
+                writer.writerow(total_row)
+                total_area_rows_written += 1  # Count the total row
+
+                # --- Write Blank Separator Row ---
+                writer.writerow([""] * num_headers)
+
+                # --- Write Raw Rows Data ---
+                # Use iterator for potentially large number of raw rows
+                for i, raw_row in enumerate(raw_rows_data_qs.iterator()):
+                    row_data = [""] * num_headers  # Initialize empty row
+
+                    # Populate the raw data starting from the correct column index
+                    col_idx = (
+                        ALL_FLOORS_HEADER_START_COL  # Base index for raw data columns
+                    )
+                    try:
+                        row_data[col_idx + 0] = raw_row.floor_name
+                        row_data[col_idx + 1] = raw_row.room_name
+                        row_data[col_idx + 2] = raw_row.is_segment
+                        row_data[col_idx + 3] = (
+                            f"{raw_row.room_id:.1f}"
+                            if raw_row.room_id is not None
+                            else ""
+                        )
+                        row_data[col_idx + 4] = (
+                            f"{raw_row.no_of_door:.0f}"
+                            if raw_row.no_of_door is not None
+                            else ""
+                        )
+                        row_data[col_idx + 5] = (
+                            f"{raw_row.no_of_window:.0f}"
+                            if raw_row.no_of_window is not None
+                            else ""
+                        )
+                        row_data[col_idx + 6] = (
+                            f"{raw_row.no_of_room_points:.0f}"
+                            if raw_row.no_of_room_points is not None
+                            else ""
+                        )
+                        row_data[col_idx + 7] = (
+                            f"{raw_row.min_x_pixels:.0f}"
+                            if raw_row.min_x_pixels is not None
+                            else ""
+                        )
+                        row_data[col_idx + 8] = (
+                            f"{raw_row.min_y_pixels:.0f}"
+                            if raw_row.min_y_pixels is not None
+                            else ""
+                        )
+                        row_data[col_idx + 9] = (
+                            f"{raw_row.max_x_pixels:.0f}"
+                            if raw_row.max_x_pixels is not None
+                            else ""
+                        )
+                        row_data[col_idx + 10] = (
+                            f"{raw_row.max_y_pixels:.0f}"
+                            if raw_row.max_y_pixels is not None
+                            else ""
+                        )
+                        # --- Add ALL OTHER raw row fields here, ensuring the index matches the headers list ---
+                        row_data[col_idx + 11] = raw_row.dimensions_imperial
+                        row_data[col_idx + 12] = raw_row.dimensions_metric
+                        row_data[col_idx + 13] = (
+                            f"{raw_row.max_area_metric:.2f}"
+                            if raw_row.max_area_metric is not None
+                            else ""
+                        )
+                        row_data[col_idx + 14] = (
+                            f"{raw_row.max_area_imperial:.0f}"
+                            if raw_row.max_area_imperial is not None
+                            else ""
+                        )
+                        row_data[col_idx + 15] = (
+                            f"{raw_row.max_area_pixels:.0f}"
+                            if raw_row.max_area_pixels is not None
+                            else ""
+                        )
+                        row_data[col_idx + 16] = (
+                            f"{raw_row.actual_area_pixels:.0f}"
+                            if raw_row.actual_area_pixels is not None
+                            else ""
+                        )
+                        row_data[col_idx + 17] = (
+                            f"{raw_row.pixel_ratio:.6f}"
+                            if raw_row.pixel_ratio is not None
+                            else ""
+                        )
+                        row_data[col_idx + 18] = (
+                            f"{raw_row.scale_metric:.6f}"
+                            if raw_row.scale_metric is not None
+                            else ""
+                        )
+                        row_data[col_idx + 19] = (
+                            f"{raw_row.scale_imperial:.6f}"
+                            if raw_row.scale_imperial is not None
+                            else ""
+                        )
+                        row_data[col_idx + 20] = (
+                            f"{raw_row.calculated_sq_area_metric:.2f}"
+                            if raw_row.calculated_sq_area_metric is not None
+                            else ""
+                        )
+                        row_data[col_idx + 21] = (
+                            f"{raw_row.calculated_floor_total_sq_area_metric:.2f}"
+                            if raw_row.calculated_floor_total_sq_area_metric is not None
+                            else ""
+                        )
+                        row_data[col_idx + 22] = (
+                            f"{raw_row.calculated_area_imperial:.0f}"
+                            if raw_row.calculated_area_imperial is not None
+                            else ""
+                        )
+                        row_data[col_idx + 23] = (
+                            f"{raw_row.calculated_floor_total_sq_area_imperial:.0f}"
+                            if raw_row.calculated_floor_total_sq_area_imperial
+                            is not None
+                            else ""
+                        )
+                    except IndexError:
+                        logger.error(
+                            f"IndexError while processing raw row {raw_row.pk}. Header count ({num_headers}) might mismatch populated columns."
+                        )
+                        # Handle error or break, depending on desired strictness
+                        raise CommandError(
+                            "Header count mismatch during raw row processing. Check headers list and population logic."
+                        )
+
+                    writer.writerow(row_data)
+
+            self.stdout.write(
+                self.style.SUCCESS(f"Successfully generated report: {output_file}")
+            )
+
+        except IOError as e:
+            raise CommandError(f"Error writing to file {output_file}: {e}")
+        except Exception as e:
+            logger.exception("An unexpected error occurred during report generation.")
+            raise CommandError(f"An unexpected error occurred: {e}")
+
+
+# floorplan/management/commands/process_floorplan_csv.py
+# floorplan/management/commands/process_floorplan_csv.py
+
+import csv
+import logging
+import time
+
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+
+from floorplan.tasks import process_floorplan_analysis
+
+logger = logging.getLogger(__name__)
+
+
+class Command(BaseCommand):
+    help = "Reads a CSV with property and floorplan URLs, triggers analysis task for each property with a delay."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "input_csv_path", type=str, help="Path to the input CSV file."
+        )
+        parser.add_argument(
+            "output_log_csv_path",
+            type=str,
+            help="Path to the output CSV file logging triggered tasks.",
+        )
+        parser.add_argument(
+            "--delay",
+            type=int,
+            default=60,
+            help="Delay in seconds between triggering analysis for each property.",
+        )
+        parser.add_argument(
+            "--start-row",
+            type=int,
+            default=1,
+            help="1-based row number to start processing from (including header row).",
+        )
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            help="Maximum number of properties (rows) to process.",
+        )
+
+    def handle(self, *args, **options):
+        input_csv_path = options["input_csv_path"]
+        output_log_csv_path = options["output_log_csv_path"]
+        delay_seconds = options["delay"]
+        start_row = options["start_row"]
+        limit = options["limit"]
+
+        processed_count = 0
+        triggered_rows_log = []
+
+        self.stdout.write(f"Reading input CSV: {input_csv_path}")
+        # ... (rest of setup logging) ...
+
+        try:
+            with open(input_csv_path, mode="r", encoding="utf-8-sig") as infile:
+                reader = csv.DictReader(infile)
+                headers = reader.fieldnames
+
+                if not all(
+                    h in headers
+                    for h in [
+                        "Property ID",
+                        "User ID",
+                        "Property URL",
+                        "Floorplan URLs",
+                    ]
+                ):
+                    raise CommandError(
+                        "Input CSV must contain columns: 'Property ID', 'User ID', 'Property URL', 'Floorplan URLs'"
+                    )
+
+                triggered_rows_log.append(headers + ["Status", "Timestamp"])
+
+                for i, row in enumerate(reader, start=2):
+                    if i < start_row:
+                        continue
+                    if limit is not None and processed_count >= limit:
+                        self.stdout.write(
+                            f"Reached processing limit of {limit}. Stopping."
+                        )
+                        break
+
+                    property_id_csv = row.get("Property ID", "").strip()
+                    user_id_csv = row.get("User ID", "").strip()
+                    property_url_csv = row.get("Property URL", "").strip()
+                    floorplan_urls_str = row.get("Floorplan URLs", "").strip()
+
+                    if not property_id_csv or not user_id_csv or not floorplan_urls_str:
+                        # ... (skip logging) ...
+                        continue
+
+                    floorplan_urls = [
+                        url.strip()
+                        for url in floorplan_urls_str.split(",")
+                        if url.strip()
+                    ]
+
+                    if not floorplan_urls:
+                        # ... (skip logging) ...
+                        continue
+
+                    # --- Build the payload with numerical index keys ---
+                    floorplans_payload = {}
+                    for idx, fp_url in enumerate(floorplan_urls):
+                        # Use the string representation of the index as the key
+                        floorplans_payload[str(idx)] = {  # <--- CHANGE HERE
+                            "url": fp_url,
+                            "notes": "",
+                        }
+                    # --- End payload modification ---
+
+                    # Trigger the Celery task
+                    try:
+                        self.stdout.write(
+                            f"Processing row {i}: Triggering analysis for Property ID '{property_id_csv}', User ID '{user_id_csv}' with {len(floorplans_payload)} floorplan(s)..."
+                        )
+                        process_floorplan_analysis.delay(
+                            user_id=str(user_id_csv),
+                            property_id=str(property_id_csv),
+                            floorplans=floorplans_payload,  # Pass the dict with '0', '1', ... keys
+                        )
+                        # ... (rest of try block: success logging, delay) ...
+                        status_msg = "Triggered"
+                        processed_count += 1
+                        if delay_seconds > 0:
+                            self.stdout.write(
+                                f"  Waiting for {delay_seconds} seconds..."
+                            )
+                            time.sleep(delay_seconds)
+
+                    except Exception as e:
+                        # ... (error logging) ...
+                        status_msg = f"Error - {e}"
+
+                    # Log the outcome
+                    log_row = [row.get(h, "") for h in headers] + [
+                        status_msg,
+                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                    ]
+                    triggered_rows_log.append(log_row)
+
+        except FileNotFoundError:
+            raise CommandError(f"Input CSV file not found: {input_csv_path}")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred during CSV processing: {e}")
+            raise CommandError(f"An unexpected error occurred: {e}")
+
+        # Write the output log CSV
+        # ... (rest of file: writing log csv) ...
+        try:
+            with open(
+                output_log_csv_path, mode="w", newline="", encoding="utf-8"
+            ) as outfile:
+                writer = csv.writer(outfile)
+                writer.writerows(triggered_rows_log)
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Finished processing. Triggered {processed_count} tasks. Log saved to {output_log_csv_path}"
+                )
+            )
+        except IOError as e:
+            raise CommandError(
+                f"Error writing output log CSV file {output_log_csv_path}: {e}"
+            )
+
+
 # floorplan/utils/backup.py
 import requests
 from django.conf import settings
 from django.forms.models import model_to_dict
 
+from floorplan_service.config.logging_config import configure_logger
+
+logger = configure_logger(__name__)
+
 
 def backup_floorplan(instance):
-    # Build the analysis result payload (exclude auto fields)
-    analysis_result_payload = {
-        "message": instance.analysis_result.message,
-        "user_id": instance.analysis_result.user_id,
-        "property_id": instance.analysis_result.property_id,
-    }
-
-    # Build the main floorplan payload – only required fields.
-    payload = {
-        "analysis_result": analysis_result_payload,
-        "floorplan_id": instance.floorplan_id,
-        "original_url": instance.original_url,
-    }
-
-    # Build the AllFloorsData payload if available.
-    if hasattr(instance, "all_floors_data"):
-        all_floors = instance.all_floors_data
-        all_floors_payload = {
-            "json_file_url": all_floors.json_file_url,
-            "csv_url": all_floors.csv_url,
-            "total_area_csv_url": all_floors.total_area_csv_url,
-            "image_labelme_side_by_side_url": all_floors.image_labelme_side_by_side_url,
-            "notes": all_floors.notes,
-        }
-
-        # Process CSV floors
-        csv_floors_list = []
-        for csv_floor in all_floors.csv_floors.all():
-            csv_floor_payload = {
-                "floor_name": csv_floor.floor_name,
-                "calculated_total_area_metric": csv_floor.calculated_total_area_metric,
-                "calculated_total_area_imperial": csv_floor.calculated_total_area_imperial,
-            }
-            rooms_list = []
-            for room in csv_floor.rooms.all():
-                room_payload = {
-                    "room_name": room.room_name,
-                    "is_segment": room.is_segment,
-                    "room_id": room.room_id,
-                    "no_of_doors": room.no_of_doors,
-                    "no_of_windows": room.no_of_windows,
-                    "no_of_room_points": room.no_of_room_points,
-                }
-                # Include pixel data if available
-                if hasattr(room, "pixel_data"):
-                    pd = room.pixel_data
-                    room_payload["backup_pixel_data"] = {
-                        "min_x_pixels": pd.min_x_pixels,
-                        "min_y_pixels": pd.min_y_pixels,
-                        "max_x_pixels": pd.max_x_pixels,
-                        "max_y_pixels": pd.max_y_pixels,
-                        "max_area_pixels": pd.max_area_pixels,
-                        "actual_area_pixels": pd.actual_area_pixels,
-                        "pixel_ratio": pd.pixel_ratio,
-                    }
-                # Include dimensions if available
-                if hasattr(room, "dimensions"):
-                    dims = room.dimensions
-                    room_payload["backup_dimensions"] = {
-                        "dimensions_imperial": dims.dimensions_imperial,
-                        "dimensions_metric": dims.dimensions_metric,
-                        "max_area_metric": dims.max_area_metric,
-                        "max_area_imperial": dims.max_area_imperial,
-                        "calculated_sq_area_metric": dims.calculated_sq_area_metric,
-                        # The backup model also has fields for total floor area;
-                        # if you don't have values, send None:
-                        "calculated_floor_total_sq_area_metric": None,
-                        "calculated_area_imperial": dims.calculated_area_imperial,
-                        "calculated_floor_total_sq_area_imperial": None,
-                    }
-                # Include scaling factors if available
-                if hasattr(room, "scaling_factors"):
-                    sf = room.scaling_factors
-                    room_payload["backup_scaling_factors"] = {
-                        "scale_metric": sf.scale_metric,
-                        "scale_imperial": sf.scale_imperial,
-                    }
-                rooms_list.append(room_payload)
-            csv_floor_payload["backup_rooms"] = rooms_list
-            csv_floors_list.append(csv_floor_payload)
-        all_floors_payload["backup_csv_floors"] = csv_floors_list
-        payload["backup_all_floors_data"] = all_floors_payload
-
-        # --- Raw Row Data ---
-        raw_rows_list = []
-        # Efficiently serialize using model_to_dict or values()
-        raw_row_queryset = all_floors.all_floors_raw_rows.all().order_by(
-            "id"
-        )  # Order for consistency
-        for raw_row in raw_row_queryset:
-            # Exclude the foreign key object itself to avoid circular refs
-            raw_row_dict = model_to_dict(raw_row, exclude=["all_floors_data"])
-            # Could add the parent ID explicitly if needed
-            # raw_row_dict['all_floors_data_id'] = raw_row.all_floors_data_id
-            raw_rows_list.append(raw_row_dict)
-        all_floors_payload["backup_all_floors_raw_rows"] = raw_rows_list
-        # --- END Raw Row Data ---
-
-    # Process PlanFloor data.
-    backup_plan_floors = []
-    for pf in instance.plan_floors.all():
-        pf_payload = {
-            "floor": pf.floor,
-            "label_me_url": pf.label_me_url,
-            "json_file_url": pf.json_file_url,
-            "image_url": pf.image_url,
-            "labelme_image_url": pf.labelme_image_url,
-            "csv_url": pf.csv_url,
-            "image_side_by_side_url": pf.image_side_by_side_url,
-        }
-        backup_plan_floors.append(pf_payload)
-    payload["backup_plan_floors"] = backup_plan_floors
-
-    # Send the payload to the backup endpoint.
-    backup_url = f"{settings.BACKUP_SERVICE_URL}/api/backup/floorplan/"
     try:
+        logger.info(
+            "Starting backup process for FloorPlan ID: %s", instance.floorplan_id
+        )
+        # Build the analysis result payload (exclude auto fields)
+        analysis_result_payload = {
+            "message": instance.analysis_result.message,
+            "user_id": instance.analysis_result.user_id,
+            "property_id": instance.analysis_result.property_id,
+        }
+
+        # Build the main floorplan payload – only required fields.
+        payload = {
+            "analysis_result": analysis_result_payload,
+            "floorplan_id": instance.floorplan_id,
+            "original_url": instance.original_url,
+        }
+
+        # Build the AllFloorsData payload if available.
+        if hasattr(instance, "all_floors_data") and instance.all_floors_data:
+            all_floors = instance.all_floors_data
+            all_floors_payload = {
+                "json_file_url": all_floors.json_file_url,
+                "csv_url": all_floors.csv_url,
+                "total_area_csv_url": all_floors.total_area_csv_url,
+                "image_labelme_side_by_side_url": all_floors.image_labelme_side_by_side_url,
+                "notes": all_floors.notes,
+                # Initialize lists for nested structures
+                "backup_csv_floors": [],
+                "backup_all_floors_raw_rows": [],  # <-- Initialize raw rows list
+                "backup_total_area_data": [],  # <-- Initialize total area list (if backing up)
+            }
+
+            # Process Structured CSV floors (CsvFloor, CsvRoom, etc.)
+            csv_floors_list = []
+            for csv_floor in all_floors.csv_floors.all():
+                csv_floor_payload = {
+                    "floor_name": csv_floor.floor_name,
+                    "calculated_total_area_metric": csv_floor.calculated_total_area_metric,
+                    "calculated_total_area_imperial": csv_floor.calculated_total_area_imperial,
+                }
+                rooms_list = []
+                for room in csv_floor.rooms.all():
+                    room_payload = {
+                        "room_name": room.room_name,
+                        "is_segment": room.is_segment,
+                        "room_id": room.room_id,
+                        "no_of_doors": room.no_of_doors,
+                        "no_of_windows": room.no_of_windows,
+                        "no_of_room_points": room.no_of_room_points,
+                    }
+                    # Include pixel data if available
+                    if hasattr(room, "pixel_data"):
+                        pd = room.pixel_data
+                        room_payload["backup_pixel_data"] = {
+                            "min_x_pixels": pd.min_x_pixels,
+                            "min_y_pixels": pd.min_y_pixels,
+                            "max_x_pixels": pd.max_x_pixels,
+                            "max_y_pixels": pd.max_y_pixels,
+                            "max_area_pixels": pd.max_area_pixels,
+                            "actual_area_pixels": pd.actual_area_pixels,
+                            "pixel_ratio": pd.pixel_ratio,
+                        }
+                    # Include dimensions if available
+                    if hasattr(room, "dimensions"):
+                        dims = room.dimensions
+                        room_payload["backup_dimensions"] = {
+                            "dimensions_imperial": dims.dimensions_imperial,
+                            "dimensions_metric": dims.dimensions_metric,
+                            "max_area_metric": dims.max_area_metric,
+                            "max_area_imperial": dims.max_area_imperial,
+                            "calculated_sq_area_metric": dims.calculated_sq_area_metric,
+                            "calculated_area_imperial": dims.calculated_area_imperial,
+                        }
+                    # Include scaling factors if available
+                    if hasattr(room, "scaling_factors"):
+                        sf = room.scaling_factors
+                        room_payload["backup_scaling_factors"] = {
+                            "scale_metric": sf.scale_metric,
+                            "scale_imperial": sf.scale_imperial,
+                        }
+                    rooms_list.append(room_payload)
+                csv_floor_payload["backup_rooms"] = rooms_list
+                csv_floors_list.append(csv_floor_payload)
+            all_floors_payload["backup_csv_floors"] = csv_floors_list
+            payload["backup_all_floors_data"] = all_floors_payload
+
+            # --- Process Raw Row Data (AllFloorsCsvRawRow) ---
+            raw_rows_list = []
+            # Efficiently serialize using model_to_dict or values()
+            raw_row_queryset = all_floors.all_floors_raw_rows.all().order_by(
+                "id"
+            )  # Order for consistency
+            for raw_row in raw_row_queryset:
+                # Exclude the foreign key object itself to avoid circular refs
+                raw_row_dict = model_to_dict(raw_row, exclude=["all_floors_data"])
+                # Could add the parent ID explicitly if needed
+                # raw_row_dict['all_floors_data_id'] = raw_row.all_floors_data_id
+                raw_rows_list.append(raw_row_dict)
+            all_floors_payload["backup_all_floors_raw_rows"] = raw_rows_list
+            logger.debug("Serialized %d raw CSV rows.", len(raw_rows_list))
+            # --- END Raw Row Data ---
+
+            # --- Process Total Area Data (TotalAreaData) --- Optional, include if needed
+            logger.debug("Serializing total area data for backup...")
+            total_area_list = []
+            total_area_queryset = all_floors.total_area_data.all().order_by(
+                "id"
+            )  # Order for consistency
+            for ta_data in total_area_queryset:
+                # Exclude the foreign key object
+                ta_data_dict = model_to_dict(ta_data, exclude=["all_floors_data"])
+                total_area_list.append(ta_data_dict)
+            all_floors_payload["backup_total_area_data"] = total_area_list
+            logger.debug("Serialized %d total area data rows.", len(total_area_list))
+            # --- END Total Area Data ---
+
+            payload["backup_all_floors_data"] = all_floors_payload
+        else:
+            logger.info(
+                "No AllFloorsData found for FloorPlan ID %s, skipping related backup data.",
+                instance.floorplan_id,
+            )
+
+        # Process PlanFloor data.
+        logger.debug("Serializing PlanFloor data...")
+        backup_plan_floors = []
+        for pf in instance.plan_floors.all():
+            pf_payload = {
+                "floor": pf.floor,
+                "label_me_url": pf.label_me_url,
+                "json_file_url": pf.json_file_url,
+                "image_url": pf.image_url,
+                "labelme_image_url": pf.labelme_image_url,
+                "csv_url": pf.csv_url,
+                "image_side_by_side_url": pf.image_side_by_side_url,
+            }
+            backup_plan_floors.append(pf_payload)
+        payload["backup_plan_floors"] = backup_plan_floors
+        logger.debug("Serialized %d PlanFloor entries.", len(backup_plan_floors))
+
+        # Send the payload to the backup endpoint.
+        backup_url = f"{settings.BACKUP_SERVICE_URL}/api/backup/floorplan/"
+        logger.info(
+            "Sending backup payload for FloorPlan ID %s to %s",
+            instance.floorplan_id,
+            backup_url,
+        )
         response = requests.post(backup_url, json=payload, timeout=5)
         # If there is a 400 or any HTTP error, log the response details.
         response.raise_for_status()
-    except requests.HTTPError as e:
-        # Log response content to help pinpoint which field is causing validation to fail.
-        error_details = response.content.decode()
-        print(f"Backup service error details: {error_details}")
-        raise Exception(f"Error backing up floorplan {instance.floorplan_id}: {str(e)}")
+        logger.info(
+            "Backup successful for FloorPlan ID %s. Response status: %s",
+            instance.floorplan_id,
+            response.status_code,
+        )
+    except requests.exceptions.Timeout:
+        logger.error(
+            "Timeout occurred while sending backup for FloorPlan ID %s to %s",
+            instance.floorplan_id,
+            backup_url,
+        )
+        # Re-raise or handle as needed - maybe retry?
+        raise Exception(
+            f"Timeout backing up floorplan {instance.floorplan_id}"
+        ) from None
+    except requests.HTTPError as http_err:
+        # Log response content to help pinpoint validation errors on the backup service
+        error_details = "No response body"
+        try:
+            error_details = (
+                http_err.response.text
+            )  # Use .text for JSON or other text formats
+        except Exception:
+            logger.warning("Could not decode error response body for backup failure.")
 
-
+        logger.error(
+            "HTTP Error backing up FloorPlan ID %s: %s - Status Code: %s - Details: %s",
+            instance.floorplan_id,
+            str(http_err),
+            http_err.response.status_code,
+            error_details,
+        )
+        raise Exception(
+            f"HTTP error backing up floorplan {instance.floorplan_id}: {str(http_err)}"
+        ) from http_err
+    except requests.RequestException as req_err:
+        logger.error(
+            "Request Exception during backup for FloorPlan ID %s: %s",
+            instance.floorplan_id,
+            str(req_err),
+        )
+        raise Exception(
+            f"Request error backing up floorplan {instance.floorplan_id}: {str(req_err)}"
+        ) from req_err
+    except Exception as e:
+        # Catch any other unexpected errors during serialization or processing
+        logger.exception(
+            "Unexpected error during backup process for FloorPlan ID %s: %s",
+            instance.floorplan_id,
+            str(e),
+        )
+        raise Exception(
+            f"Failed to complete backup for floorplan {instance.floorplan_id}"
+        ) from e

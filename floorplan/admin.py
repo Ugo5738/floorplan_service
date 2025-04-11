@@ -1,7 +1,7 @@
 from django.contrib import admin
 
 from floorplan.models import (
-    AllFloorsCsvRawRow,
+    AllFloorsCsvData,
     AllFloorsData,
     CsvFloor,
     CsvRoom,
@@ -11,7 +11,7 @@ from floorplan.models import (
     FloorPlan,
     FloorPlanAnalysisResult,
     PlanFloor,
-    TotalAreaData,
+    TotalAreasCsvData,
 )
 
 
@@ -22,7 +22,7 @@ class FloorPlanInline(admin.TabularInline):
 
 @admin.register(FloorPlanAnalysisResult)
 class FloorPlanAnalysisResultAdmin(admin.ModelAdmin):
-    list_display = ("user_id", "property_id", "message", "created_at")
+    list_display = ("id", "user_id", "property_id", "message", "created_at")
     list_filter = ("created_at",)
     search_fields = ("user_id", "property_id", "message")
     date_hierarchy = "created_at"
@@ -41,13 +41,33 @@ class AllFloorsDataInline(admin.StackedInline):
 
 @admin.register(FloorPlan)
 class FloorPlanAdmin(admin.ModelAdmin):
-    list_display = ("floorplan_id", "get_property_id", "get_user_id")
+    list_display = (
+        "get_short_floorplan_id",
+        "get_property_id",
+        "get_user_id",
+        "original_url",
+    )
     search_fields = (
-        "floorplan_id",
+        "floorplan_id",  # Search the full hash
         "analysis_result__property_id",
         "analysis_result__user_id",
+        "original_url",  # Search the URL
     )
+    # Make floorplan_id readonly since it's auto-generated
+    readonly_fields = ("floorplan_id",)
     inlines = [AllFloorsDataInline, PlanFloorInline]
+    list_select_related = ("analysis_result",)  # Optimize query
+
+    def get_short_floorplan_id(self, obj):
+        # Show first 8 and last 4 chars of hash
+        if obj.floorplan_id:
+            return f"{obj.floorplan_id[:8]}...{obj.floorplan_id[-4:]}"
+        return "N/A"
+
+    get_short_floorplan_id.short_description = "Floorplan ID (Hash)"
+    get_short_floorplan_id.admin_order_field = (
+        "floorplan_id"  # Allow sorting by full hash
+    )
 
     def get_property_id(self, obj):
         return obj.analysis_result.property_id
@@ -284,8 +304,8 @@ class CsvRoomScalingFactorsAdmin(admin.ModelAdmin):
     get_floor_name.admin_order_field = "room__floor__floor_name"
 
 
-@admin.register(AllFloorsCsvRawRow)
-class AllFloorsCsvRawRowAdmin(admin.ModelAdmin):
+@admin.register(AllFloorsCsvData)
+class AllFloorsCsvDataAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "get_floorplan_id",  # Add helper method
@@ -306,7 +326,7 @@ class AllFloorsCsvRawRowAdmin(admin.ModelAdmin):
     list_select_related = ("all_floors_data__floor_plan",)  # Optimization
     # Make most fields readonly as they represent raw data
     readonly_fields = [
-        f.name for f in AllFloorsCsvRawRow._meta.get_fields() if f.name != "id"
+        f.name for f in AllFloorsCsvData._meta.get_fields() if f.name != "id"
     ]
     list_per_page = 50
 
@@ -318,8 +338,8 @@ class AllFloorsCsvRawRowAdmin(admin.ModelAdmin):
     get_floorplan_id.short_description = "Floor Plan ID"
 
 
-@admin.register(TotalAreaData)
-class TotalAreaDataAdmin(admin.ModelAdmin):
+@admin.register(TotalAreasCsvData)
+class TotalAreasCsvDataAdmin(admin.ModelAdmin):
     list_display = (
         "area_name",
         "get_floorplan_id",  # Method needs to access FloorPlan via AllFloorsData
