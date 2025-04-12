@@ -12,8 +12,16 @@ ADMIN_PASSWORD = config("ADMIN_PASSWORD")
 
 
 # ================================ DATABASES =======================================
-raw_db_url = config("DATABASE_URL", default="sqlite:///db.sqlite3")
-DATABASES = {"default": dj_database_url.parse(raw_db_url or "sqlite:///db.sqlite3")}
+# Get the URL from environment variable or default to SQLite
+# Ensure a sensible default for local dev if DATABASE_URL isn't set
+default_db_url = config("DATABASE_URL", default=None)
+if not default_db_url:
+    # Construct a default SQLite path relative to BASE_DIR if not set
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_db_url = f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}"
+    print(f"WARNING: DATABASE_URL not set, using default SQLite: {default_db_url}")
+
+DATABASES = {"default": dj_database_url.parse(default_db_url)}
 
 # DATABASES = {
 #     "default": {
@@ -21,6 +29,46 @@ DATABASES = {"default": dj_database_url.parse(raw_db_url or "sqlite:///db.sqlite
 #         "NAME": BASE_DIR / "db.sqlite3",
 #     }
 # }
+
+
+# --- Temporary Restore Database (PostgreSQL) ---
+# Use separate environment variables or hardcode for this temporary task
+# WARNING: Hardcoding credentials is NOT recommended for production settings.
+#          Use environment variables or secrets management.
+TEMP_RESTORE_DB_NAME = config(
+    "TEMP_RESTORE_DB_NAME", default="floorplandb_temp_restore"
+)
+TEMP_RESTORE_DB_USER = config(
+    "TEMP_RESTORE_DB_USER", default="danai"
+)  # User with access
+TEMP_RESTORE_DB_PASSWORD = config("TEMP_RESTORE_DB_PASSWORD", default="")
+TEMP_RESTORE_DB_HOST = config("TEMP_RESTORE_DB_HOST", default="localhost")
+TEMP_RESTORE_DB_PORT = config("TEMP_RESTORE_DB_PORT", default="5432")
+
+# Only add the temp DB config if essential details are provided
+if TEMP_RESTORE_DB_NAME and TEMP_RESTORE_DB_USER:  # Add PASSWORD check if required
+    DATABASES["temp_restore"] = {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": TEMP_RESTORE_DB_NAME,
+        "USER": TEMP_RESTORE_DB_USER,
+        "PASSWORD": TEMP_RESTORE_DB_PASSWORD,
+        "HOST": TEMP_RESTORE_DB_HOST,
+        "PORT": TEMP_RESTORE_DB_PORT,
+        "TEST": {
+            # Prevent Django from trying to manage this DB during tests
+            # Often mirroring 'default' or setting 'SERIALIZE': False is needed
+            "MIRROR": "default",
+        },
+        # Optional: Add connection options if needed
+        # 'OPTIONS': {
+        #     'connect_timeout': 5,
+        # }
+    }
+    print(f"INFO: Temporary restore database '{TEMP_RESTORE_DB_NAME}' configured.")
+else:
+    print(
+        "WARNING: Temporary restore database configuration skipped (missing NAME or USER)."
+    )
 # ================================ DATABASES =======================================
 
 

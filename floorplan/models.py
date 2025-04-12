@@ -121,9 +121,7 @@ class CsvFloor(TrackingModel):
         AllFloorsData, related_name="csv_floors", on_delete=models.CASCADE
     )
     floor_name = models.CharField(max_length=100, null=True, blank=True)
-    # calculated_floor_total_sq_area_metric
     calculated_total_area_metric = models.FloatField(null=True, blank=True)
-    # calculated_floor_total_sq_area_imperial
     calculated_total_area_imperial = models.FloatField(null=True, blank=True)
     history = HistoricalRecords()
 
