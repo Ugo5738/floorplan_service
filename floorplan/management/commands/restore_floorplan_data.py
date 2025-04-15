@@ -41,7 +41,6 @@ OLD_TOTALAREA_TABLE = "floorplan_totalareadata"
 
 # --- Hashing function (matching the one in models.py) ---
 def generate_new_hash_id(property_id, user_id, url):
-    """Generates SHA-256 hash for prop_id|user_id|url combination."""
     if not all([property_id, user_id, url]):
         logger.debug(
             f"Cannot generate hash: Missing component for Prop:'{property_id}', User:'{user_id}', URL:'{url}'"
@@ -69,6 +68,10 @@ def generate_new_hash_id(property_id, user_id, url):
 # --- User IDs to Exclude ---
 EXCLUDED_USER_IDS = {"supersami54567", "supersami5456"}
 
+# --- Cache for Parent Timestamps ---
+# Store {model_name: {new_pk: timestamp}}
+TIMESTAMP_CACHE = defaultdict(dict)
+
 
 class Command(BaseCommand):
     help = "Restores floorplan data from temporary DB backup, maps user IDs, excludes specific users, ensures unique FloorPlan hashes, and uses parent timestamps."
@@ -89,10 +92,13 @@ class Command(BaseCommand):
         parser.add_argument(
             "--clear-existing",
             action="store_true",
-            help="DANGEROUS: Delete existing data from target floorplan tables before loading.",
+            help="DANGEROUS: Delete existing data from target tables before loading.",
         )
 
     def handle(self, *args, **options):
+        global TIMESTAMP_CACHE  # Allow modifying the global cache
+        TIMESTAMP_CACHE.clear()  # Clear cache at the start of each run
+
         temp_db = options["temp_db_alias"]
         batch_size = options["batch_size"]
         clear_existing = options["clear_existing"]
@@ -128,80 +134,37 @@ class Command(BaseCommand):
             self.clear_data(prod_db)
 
         try:
-            # Run the main processing within a single transaction for consistency
             with transaction.atomic(using=prod_db):
                 self.stdout.write("Processing data within a transaction...")
 
-                # --- Process data model by model, passing PK maps and timestamps ---
-                old_pk_maps = {}  # Store all old_pk -> new_pk maps
-                analysis_creation_times = {}  # Store old_analysis_pk -> created_at
-
-                old_pk_maps["analysis"], analysis_creation_times = (
-                    self.migrate_analysis_results(temp_db, prod_db, batch_size)
-                )
+                old_pk_maps = {}
+                # Pass timestamp cache to functions that need it
+                old_pk_maps["analysis"], _ = self.migrate_analysis_results(
+                    temp_db, prod_db, batch_size
+                )  # Don't need times back here
                 old_pk_maps["floorplan"] = self.migrate_floorplans(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["analysis"],
-                    analysis_creation_times,
+                    temp_db, prod_db, batch_size, old_pk_maps["analysis"]
                 )
                 old_pk_maps["allfloorsdata"] = self.migrate_allfloorsdata(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["floorplan"],
-                    analysis_creation_times,
+                    temp_db, prod_db, batch_size, old_pk_maps["floorplan"]
                 )
-
-                # Models needing FloorPlan PK Map
                 self.migrate_planfloors(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["floorplan"],
-                    analysis_creation_times,
+                    temp_db, prod_db, batch_size, old_pk_maps["floorplan"]
                 )
-
-                # Models needing AllFloorsData PK Map
                 old_pk_maps["csvfloor"] = self.migrate_csvfloors(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["allfloorsdata"],
-                    analysis_creation_times,
+                    temp_db, prod_db, batch_size, old_pk_maps["allfloorsdata"]
+                )
+                old_pk_maps["csvroom"] = self.migrate_csvrooms(
+                    temp_db, prod_db, batch_size, old_pk_maps["csvfloor"]
+                )
+                self.migrate_csvroom_details(
+                    temp_db, prod_db, batch_size, old_pk_maps["csvroom"]
                 )
                 self.migrate_rawrows(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["allfloorsdata"],
-                    analysis_creation_times,
+                    temp_db, prod_db, batch_size, old_pk_maps["allfloorsdata"]
                 )
                 self.migrate_totalareas(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["allfloorsdata"],
-                    analysis_creation_times,
-                )
-
-                # Models needing CsvFloor PK Map
-                old_pk_maps["csvroom"] = self.migrate_csvrooms(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["csvfloor"],
-                    analysis_creation_times,
-                )
-
-                # Models needing CsvRoom PK Map
-                self.migrate_csvroom_details(
-                    temp_db,
-                    prod_db,
-                    batch_size,
-                    old_pk_maps["csvroom"],
-                    analysis_creation_times,
+                    temp_db, prod_db, batch_size, old_pk_maps["allfloorsdata"]
                 )
 
             self.stdout.write(
@@ -224,43 +187,14 @@ class Command(BaseCommand):
         cursor.execute(query)
         return cursor
 
-    def _get_parent_timestamp(
-        self, target_model_name, fk_value, parent_model, pk_map, time_map, fallback_ts
-    ):
-        """Helper to find the timestamp by tracing back FKs."""
-        parent_pk = pk_map.get(fk_value)
-        if parent_pk:
-            # Try getting timestamp directly if it's the AnalysisResult map
-            if parent_model == FloorPlanAnalysisResult:
-                return time_map.get(
-                    fk_value, fallback_ts
-                )  # Use old FK value for time map
-            # Otherwise, query the parent object (assuming it exists now)
-            try:
-                # Select only the necessary field for timestamp propagation
-                parent_obj = (
-                    parent_model.objects.using("default")
-                    .only("analysis_result__created_at")
-                    .get(pk=parent_pk)
-                )
-                # Navigate relationships - adjust based on actual FK paths
-                if isinstance(parent_obj, FloorPlan):
-                    return parent_obj.analysis_result.created_at
-                elif isinstance(parent_obj, AllFloorsData):
-                    return parent_obj.floor_plan.analysis_result.created_at
-                elif isinstance(parent_obj, CsvFloor):
-                    return (
-                        parent_obj.all_floors_data.floor_plan.analysis_result.created_at
-                    )
-                elif isinstance(parent_obj, CsvRoom):
-                    return (
-                        parent_obj.floor.all_floors_data.floor_plan.analysis_result.created_at
-                    )
-                # Add more cases if needed
-            except Exception as e:
-                logger.warning(
-                    f"Could not retrieve timestamp for {target_model_name} via parent {parent_model.__name__} pk={parent_pk}: {e}"
-                )
+    def _get_timestamp_from_cache(self, model_name, new_pk, fallback_ts):
+        """Gets timestamp from cache or returns fallback."""
+        ts = TIMESTAMP_CACHE[model_name].get(new_pk)
+        if ts:
+            return ts
+        logger.debug(
+            f"Timestamp cache miss for {model_name} pk={new_pk}. Using fallback."
+        )
         return fallback_ts
 
     def clear_data(self, prod_db):
@@ -286,10 +220,11 @@ class Command(BaseCommand):
         self.stdout.write("Existing data cleared.")
 
     def migrate_analysis_results(self, temp_db, prod_db, batch_size):
-        """Migrates FloorPlanAnalysisResult, handling user mapping/exclusions and returning PK map and timestamp map."""
+        """Migrates FloorPlanAnalysisResult, handling user mapping/exclusions and returning PK map and populating timestamp cache."""
+        global TIMESTAMP_CACHE
         self.stdout.write("Migrating FloorPlanAnalysisResult...")
         old_to_new_pk_map = {}
-        analysis_creation_times = {}  # Store old_pk -> created_at
+        # analysis_creation_times = {} # Store old_pk -> created_at (replaced by global cache)
         total_processed = 0
         skipped_excluded = 0
         skipped_empty = 0
@@ -325,13 +260,15 @@ class Command(BaseCommand):
                     skipped_empty += 1
                     continue
 
-                timestamp = created_at_old or timezone.now()
+                timestamp = (
+                    created_at_old or timezone.now()
+                )  # Use old timestamp if available
                 new_obj = FloorPlanAnalysisResult(
                     message=message[:255],
                     user_id=user_id,
                     property_id=prop_id,
                     created_at=timestamp,
-                    updated_at=timestamp,
+                    updated_at=timestamp,  # Set both initially
                 )
                 new_objs_to_create.append(new_obj)
                 temp_map[old_pk] = (user_id_orig, prop_id_orig, timestamp, new_obj)
@@ -368,9 +305,10 @@ class Command(BaseCommand):
                         if pk_ts_tuple:
                             new_pk, actual_created_at = pk_ts_tuple
                             old_to_new_pk_map[old_pk] = new_pk
-                            analysis_creation_times[old_pk] = (
-                                actual_created_at  # Store time using OLD PK as key
-                            )
+                            # Store timestamp against NEW PK for children to use
+                            TIMESTAMP_CACHE["FloorPlanAnalysisResult"][
+                                new_pk
+                            ] = actual_created_at
                             batch_proc += 1
                         else:
                             ignored_dups += 1
@@ -385,19 +323,16 @@ class Command(BaseCommand):
 
         cursor.close()
         self.stdout.write(
-            f"Finished migrating {total_processed} analysis results. SkipExcl: {skipped_excluded}, SkipEmpty: {skipped_empty}, IgnoreDup: {ignored_dups}. PK map:{len(old_to_new_pk_map)}"
+            f"Finished migrating {total_processed} analysis results. SkipExcl: {skipped_excluded}, SkipEmpty: {skipped_empty}, IgnoreDup: {ignored_dups}. PK map size: {len(old_to_new_pk_map)}"
         )
-        return old_to_new_pk_map, analysis_creation_times
+        # Return only the PK map, timestamps are now in global cache
+        return old_to_new_pk_map, {}  # Return empty dict for timestamps
 
     def migrate_floorplans(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_analysis_pk_map,
-        analysis_creation_times,
+        self, temp_db, prod_db, batch_size, old_to_new_analysis_pk_map
     ):
         """Migrates FloorPlan, ensuring unique calculated hashes."""
+        global TIMESTAMP_CACHE
         self.stdout.write("Migrating FloorPlan...")
         old_to_new_pk = {}
         processed_hashes = set()
@@ -408,14 +343,18 @@ class Command(BaseCommand):
         fixed_url = 0
 
         # Cache analysis results needed for hash
-        analysis_results_cache = {
-            item["pk"]: item
-            for item in FloorPlanAnalysisResult.objects.using(prod_db)
+        analysis_results_queryset = (
+            FloorPlanAnalysisResult.objects.using(prod_db)
             .filter(pk__in=old_to_new_analysis_pk_map.values())
             .values("pk", "user_id", "property_id", "created_at")
+        )  # Fetch required fields
+
+        analysis_results_cache = {
+            item["pk"]: item
+            for item in analysis_results_queryset  # Iterate and build dict
         }
         self.stdout.write(
-            f"  Fetched {len(analysis_results_cache)} relevant analysis results."
+            f"  Fetched {len(analysis_results_cache)} relevant analysis results into cache."
         )
 
         cursor = self._get_cursor(temp_db)
@@ -461,7 +400,10 @@ class Command(BaseCommand):
                     continue
                 processed_hashes.add(new_hash)
 
-                timestamp = analysis_result_data["created_at"]  # Use parent's timestamp
+                # Get timestamp from parent cache
+                timestamp = self._get_timestamp_from_cache(
+                    "FloorPlanAnalysisResult", new_analysis_pk, timezone.now()
+                )
 
                 new_obj = FloorPlan(
                     analysis_result_id=new_analysis_pk,
@@ -479,18 +421,21 @@ class Command(BaseCommand):
                     created_objs = FloorPlan.objects.using(prod_db).bulk_create(
                         new_objs_to_create, batch_size=batch_size
                     )
-                    # Map PKs
+                    # Map old PK to new PK and cache timestamp
                     for old_pk, temp_obj in temp_map.items():
                         for created_obj in created_objs:
                             if temp_obj.floorplan_id == created_obj.floorplan_id:
-                                old_to_new_pk[old_pk] = created_obj.pk
+                                new_pk = created_obj.pk
+                                old_to_new_pk[old_pk] = new_pk
+                                # Cache timestamp for children, using NEW pk as key
+                                TIMESTAMP_CACHE["FloorPlan"][
+                                    new_pk
+                                ] = created_obj.created_at
                                 created_objs.remove(created_obj)
                                 break
                         else:
                             logger.error(f"Map Fail: FP old={old_pk}")
-                    total_processed += len(
-                        new_objs_to_create
-                    )  # Count attempts processed in batch
+                    total_processed += len(new_objs_to_create)
                     self.stdout.write(f"  Processed {total_processed} floorplans...")
                 except Exception as e:
                     self.stderr.write(self.style.ERROR(f" Error: {e}"))
@@ -501,15 +446,9 @@ class Command(BaseCommand):
         )
         return old_to_new_pk
 
-    def migrate_allfloorsdata(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_fp_pk_map,
-        analysis_creation_times,
-    ):
+    def migrate_allfloorsdata(self, temp_db, prod_db, batch_size, old_to_new_fp_pk_map):
         """Migrates AllFloorsData."""
+        global TIMESTAMP_CACHE
         self.stdout.write(f"Migrating AllFloorsData (from {OLD_AFD_TABLE})...")
         old_to_new_pk = {}
         total_processed = 0
@@ -531,14 +470,8 @@ class Command(BaseCommand):
                     skipped_fk += 1
                     continue
 
-                # Find timestamp via FloorPlan -> AnalysisResult relationship
-                timestamp = self._get_parent_timestamp(
-                    "AllFloorsData",
-                    old_fp_pk,
-                    FloorPlan,
-                    old_to_new_fp_pk_map,
-                    analysis_creation_times,
-                    timezone.now(),
+                timestamp = self._get_timestamp_from_cache(
+                    "FloorPlan", new_fp_pk, timezone.now()
                 )
 
                 obj = AllFloorsData(
@@ -557,24 +490,25 @@ class Command(BaseCommand):
                 try:
                     created = AllFloorsData.objects.using(prod_db).bulk_create(
                         new_objs, batch_size=batch_size, ignore_conflicts=True
-                    )  # Use ignore for OneToOne
-                    # Map PKs
+                    )
                     created_pks = {
-                        o.floor_plan_id: o.pk
+                        o.floor_plan_id: (o.pk, o.created_at)
                         for o in AllFloorsData.objects.using(prod_db)
                         .filter(floor_plan_id__in=[o.floor_plan_id for o in new_objs])
-                        .only("pk", "floor_plan_id")
+                        .only("pk", "floor_plan_id", "created_at")
                     }
                     batch_proc = 0
                     for old_pk, temp_obj in temp_map.items():
-                        new_pk = created_pks.get(temp_obj.floor_plan_id)
-                        if new_pk:
+                        pk_ts_tuple = created_pks.get(temp_obj.floor_plan_id)
+                        if pk_ts_tuple:
+                            new_pk, actual_ts = pk_ts_tuple
                             old_to_new_pk[old_pk] = new_pk
+                            TIMESTAMP_CACHE["AllFloorsData"][new_pk] = actual_ts
                             batch_proc += 1
                         else:
                             ignored_dups += 1
                             logger.warning(
-                                f"AllFloorsData old_pk={old_pk} skipped/ignored (duplicate floor_plan_id?)."
+                                f"AllFloorsData old_pk={old_pk} skipped/ignored."
                             )
                     total_processed += batch_proc
                     if batch_proc > 0:
@@ -590,15 +524,9 @@ class Command(BaseCommand):
         )
         return old_to_new_pk
 
-    def migrate_planfloors(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_fp_pk_map,
-        analysis_creation_times,
-    ):
+    def migrate_planfloors(self, temp_db, prod_db, batch_size, old_to_new_fp_pk_map):
         """Migrates PlanFloor."""
+        global TIMESTAMP_CACHE
         self.stdout.write(f"Migrating PlanFloor (from {OLD_PF_TABLE})...")
         total_processed = 0
         skipped_fk = 0
@@ -626,13 +554,8 @@ class Command(BaseCommand):
                 if new_fp_pk is None:
                     skipped_fk += 1
                     continue
-                timestamp = self._get_parent_timestamp(
-                    "PlanFloor",
-                    old_fp_pk,
-                    FloorPlan,
-                    old_to_new_fp_pk_map,
-                    analysis_creation_times,
-                    timezone.now(),
+                timestamp = self._get_timestamp_from_cache(
+                    "FloorPlan", new_fp_pk, timezone.now()
                 )
 
                 obj = PlanFloor(
@@ -654,6 +577,7 @@ class Command(BaseCommand):
                         new_objs, batch_size=batch_size
                     )
                     total_processed += len(created)
+                    # No PK map needed for PlanFloor usually, unless another table depends on its *new* PK
                     self.stdout.write(f"  Processed {total_processed} PlanFloors...")
                 except Exception as e:
                     self.stderr.write(self.style.ERROR(f" Error: {e}"))
@@ -663,19 +587,14 @@ class Command(BaseCommand):
             f"Finished PlanFloor. Processed:{total_processed}, SkipFK:{skipped_fk}."
         )
 
-    def migrate_csvfloors(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_afd_pk_map,
-        analysis_creation_times,
-    ):
+    def migrate_csvfloors(self, temp_db, prod_db, batch_size, old_to_new_afd_pk_map):
         """Migrates CsvFloor."""
+        global TIMESTAMP_CACHE
         self.stdout.write(f"Migrating CsvFloor (from {OLD_CSVFLOOR_TABLE})...")
         old_to_new_pk = {}
         total_processed = 0
         skipped_fk = 0
+        ignored_dups = 0
         query = f"SELECT id, all_floors_data_id, floor_name, calculated_total_area_metric, calculated_total_area_imperial FROM {OLD_CSVFLOOR_TABLE} ORDER BY id"
         cursor = self._get_cursor(temp_db)
         self._execute_query(cursor, query)
@@ -691,13 +610,8 @@ class Command(BaseCommand):
                 if new_afd_pk is None:
                     skipped_fk += 1
                     continue
-                timestamp = self._get_parent_timestamp(
-                    "CsvFloor",
-                    old_afd_pk,
-                    AllFloorsData,
-                    old_to_new_afd_pk_map,
-                    analysis_creation_times,
-                    timezone.now(),
+                timestamp = self._get_timestamp_from_cache(
+                    "AllFloorsData", new_afd_pk, timezone.now()
                 )
 
                 obj = CsvFloor(
@@ -712,30 +626,35 @@ class Command(BaseCommand):
                 temp_map[old_pk] = obj
             if new_objs:
                 try:
+                    # It's possible floor_name is not unique per all_floors_data_id, so don't ignore conflicts unless needed
                     created = CsvFloor.objects.using(prod_db).bulk_create(
                         new_objs, batch_size=batch_size
                     )
-                    # Map PKs
+                    # Map PKs - Assume order is preserved or re-query based on FK+name
                     created_pks = {
-                        (o.all_floors_data_id, o.floor_name): o.pk
+                        (o.all_floors_data_id, o.floor_name): (o.pk, o.created_at)
                         for o in CsvFloor.objects.using(prod_db)
                         .filter(
                             all_floors_data_id__in=[
                                 o.all_floors_data_id for o in new_objs
                             ]
                         )
-                        .only("pk", "all_floors_data_id", "floor_name")
+                        .only("pk", "all_floors_data_id", "floor_name", "created_at")
                     }
                     batch_proc = 0
                     for old_pk, temp_obj in temp_map.items():
-                        new_pk = created_pks.get(
+                        pk_ts_tuple = created_pks.get(
                             (temp_obj.all_floors_data_id, temp_obj.floor_name)
                         )
-                        if new_pk:
+                        if pk_ts_tuple:
+                            new_pk, actual_ts = pk_ts_tuple
                             old_to_new_pk[old_pk] = new_pk
+                            TIMESTAMP_CACHE["CsvFloor"][new_pk] = actual_ts
                             batch_proc += 1
                         else:
-                            logger.warning(f"CsvFloor old_pk={old_pk} mapping failed.")
+                            logger.warning(
+                                f"CsvFloor old_pk={old_pk} mapping failed."
+                            )  # Could be due to duplicate name for same AFD
                     total_processed += batch_proc
                     if batch_proc > 0:
                         self.stdout.write(f"  Processed {total_processed} CsvFloors...")
@@ -749,14 +668,10 @@ class Command(BaseCommand):
         return old_to_new_pk
 
     def migrate_csvrooms(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_csvfloor_pk_map,
-        analysis_creation_times,
+        self, temp_db, prod_db, batch_size, old_to_new_csvfloor_pk_map
     ):
         """Migrates CsvRoom."""
+        global TIMESTAMP_CACHE
         self.stdout.write(f"Migrating CsvRoom (from {OLD_CSVROOM_TABLE})...")
         old_to_new_pk = {}
         total_processed = 0
@@ -786,13 +701,8 @@ class Command(BaseCommand):
                 if new_floor_pk is None:
                     skipped_fk += 1
                     continue
-                timestamp = self._get_parent_timestamp(
-                    "CsvRoom",
-                    old_floor_pk,
-                    CsvFloor,
-                    old_to_new_csvfloor_pk_map,
-                    analysis_creation_times,
-                    timezone.now(),
+                timestamp = self._get_timestamp_from_cache(
+                    "CsvFloor", new_floor_pk, timezone.now()
                 )
 
                 obj = CsvRoom(
@@ -813,18 +723,22 @@ class Command(BaseCommand):
                     created = CsvRoom.objects.using(prod_db).bulk_create(
                         new_objs, batch_size=batch_size, ignore_conflicts=True
                     )
-                    # Map PKs
+                    # Map PKs (match on floor_id + room_id?)
                     created_pks = {
-                        (o.floor_id, o.room_id): o.pk
+                        (o.floor_id, o.room_id): (o.pk, o.created_at)
                         for o in CsvRoom.objects.using(prod_db)
                         .filter(floor_id__in=[o.floor_id for o in new_objs])
-                        .only("pk", "floor_id", "room_id")
+                        .only("pk", "floor_id", "room_id", "created_at")
                     }
                     batch_proc = 0
                     for old_pk, temp_obj in temp_map.items():
-                        new_pk = created_pks.get((temp_obj.floor_id, temp_obj.room_id))
-                        if new_pk:
+                        pk_ts_tuple = created_pks.get(
+                            (temp_obj.floor_id, temp_obj.room_id)
+                        )
+                        if pk_ts_tuple:
+                            new_pk, actual_ts = pk_ts_tuple
                             old_to_new_pk[old_pk] = new_pk
+                            TIMESTAMP_CACHE["CsvRoom"][new_pk] = actual_ts
                             batch_proc += 1
                         else:
                             ignored_dups += 1
@@ -844,17 +758,11 @@ class Command(BaseCommand):
         return old_to_new_pk
 
     def migrate_csvroom_details(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_csvroom_pk_map,
-        analysis_creation_times,
+        self, temp_db, prod_db, batch_size, old_to_new_csvroom_pk_map
     ):
         """Migrates CsvRoomPixelData, CsvRoomDimensions, CsvRoomScalingFactors."""
+        global TIMESTAMP_CACHE
         self.stdout.write("Migrating CsvRoom Details (Pixel, Dimensions, Scaling)...")
-        # Note: These are OneToOne fields to CsvRoom
-        # Map old column names to new field names carefully
         model_map = {
             "Pixel": (
                 OLD_CSVROOMPIXEL_TABLE,
@@ -902,10 +810,11 @@ class Command(BaseCommand):
             total_processed = 0
             skipped_fk = 0
             ignored_dups = 0
+            old_cols_list = list(col_map.keys())  # Get ordered list of old columns
             old_cols_str = ", ".join(
-                [f'"{c}"' for c in col_map.keys() if c != "id"]
-            )  # Quote column names if needed
-            query = f"SELECT id, {old_cols_str} FROM {old_table} ORDER BY id"
+                [f'"{c}"' for c in old_cols_list if c is not None]
+            )  # Select only mapped cols
+            query = f"SELECT {old_cols_str} FROM {old_table} ORDER BY id"
             cursor = self._get_cursor(temp_db)
             self._execute_query(cursor, query)
 
@@ -915,21 +824,22 @@ class Command(BaseCommand):
                     break
                 new_objs = []
                 for row in rows:
-                    old_pk = row[0]
-                    old_room_pk = row[
-                        1
-                    ]  # Assuming room_id is always the second column selected
+                    # Map row values to a dict based on old_cols_list
+                    old_data_dict = {
+                        col_name: value for col_name, value in zip(old_cols_list, row)
+                    }
+                    old_room_pk = old_data_dict.get(
+                        "room_id"
+                    )  # Get FK value using name
+                    if old_room_pk is None:
+                        continue  # Should not happen if selected
+
                     new_room_pk = old_to_new_csvroom_pk_map.get(old_room_pk)
                     if new_room_pk is None:
                         skipped_fk += 1
                         continue
-                    timestamp = self._get_parent_timestamp(
-                        f"CsvRoom{name}",
-                        old_room_pk,
-                        CsvRoom,
-                        old_to_new_csvroom_pk_map,
-                        analysis_creation_times,
-                        timezone.now(),
+                    timestamp = self._get_timestamp_from_cache(
+                        "CsvRoom", new_room_pk, timezone.now()
                     )
 
                     data = {
@@ -937,26 +847,19 @@ class Command(BaseCommand):
                         "created_at": timestamp,
                         "updated_at": timestamp,
                     }
-                    old_col_list = list(
-                        col_map.keys()
-                    )  # Get ordered list of old columns queried (including id)
-                    for i, value in enumerate(row):
-                        if i == 0:
-                            continue  # Skip old_pk
-                        model_field_name = col_map[old_col_list[i]]
+                    for old_col, model_field_name in col_map.items():
                         if (
                             model_field_name and model_field_name != "room_id"
-                        ):  # Skip id and already set room_id
-                            data[model_field_name] = value
+                        ):  # Skip id, fk
+                            data[model_field_name] = old_data_dict.get(old_col)
 
                     new_objs.append(NewModel(**data))
-
                 if new_objs:
                     try:
                         created = NewModel.objects.using(prod_db).bulk_create(
                             new_objs, batch_size=batch_size, ignore_conflicts=True
                         )
-                        total_processed += len(created)
+                        total_processed += len(created)  # Count successful creations
                         self.stdout.write(
                             f"    Processed {total_processed} {name} details..."
                         )
@@ -970,20 +873,15 @@ class Command(BaseCommand):
                 f"  Finished {name}. Processed:{total_processed}, SkipFK:{skipped_fk}."
             )
 
-    def migrate_rawrows(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_afd_pk_map,
-        analysis_creation_times,
-    ):
+    def migrate_rawrows(self, temp_db, prod_db, batch_size, old_to_new_afd_pk_map):
         """Migrates AllFloorsCsvData (renamed from AllFloorsCsvRawRow)."""
+        global TIMESTAMP_CACHE
         self.stdout.write(f"Migrating AllFloorsCsvData (from {OLD_RAWROW_TABLE})...")
         total_processed = 0
         skipped_fk = 0
         cursor = self._get_cursor(temp_db)
-        # Select all columns assumed to exist in the old raw row table
+        # Select ONLY columns that existed in the OLD raw table schema
+        # EXCLUDE calculated_floor_total_sq_area_metric and calculated_floor_total_sq_area_imperial
         cursor.execute(
             f"""
              SELECT id, all_floors_data_id, floor_name, room_name, is_segment, room_id,
@@ -991,8 +889,10 @@ class Command(BaseCommand):
                  max_x_pixels_csv, max_y_pixels_csv, dimensions_imperial, dimensions_metric,
                  max_area_metric_csv, max_area_imperial_csv, max_area_pixels_csv,
                  actual_area_pixels_csv, pixel_ratio_csv, scale_metric_csv, scale_imperial_csv,
-                 calculated_sq_area_metric_csv, calculated_floor_total_sq_area_metric,
-                 calculated_area_imperial_csv, calculated_floor_total_sq_area_imperial
+                 calculated_sq_area_metric_csv,
+                 -- calculated_floor_total_sq_area_metric, -- REMOVED
+                 calculated_area_imperial_csv
+                 -- calculated_floor_total_sq_area_imperial -- REMOVED
              FROM {OLD_RAWROW_TABLE} ORDER BY id
          """
         )
@@ -1003,6 +903,7 @@ class Command(BaseCommand):
                 break
             new_objs = []
             for row in old_rows:
+                # Adjust tuple unpacking to match the reduced SELECT statement
                 (
                     old_pk,
                     old_afd_pk,
@@ -1027,22 +928,17 @@ class Command(BaseCommand):
                     scale_met,
                     scale_imp,
                     calc_sq_met,
-                    calc_floor_met,
+                    # Removed calc_floor_met
                     calc_a_imp,
-                    calc_floor_imp,
+                    # Removed calc_floor_imp
                 ) = row
 
                 new_afd_pk = old_to_new_afd_pk_map.get(old_afd_pk)
                 if new_afd_pk is None:
                     skipped_fk += 1
                     continue
-                timestamp = self._get_parent_timestamp(
-                    "AllFloorsCsvData",
-                    old_afd_pk,
-                    AllFloorsData,
-                    old_to_new_afd_pk_map,
-                    analysis_creation_times,
-                    timezone.now(),
+                timestamp = self._get_timestamp_from_cache(
+                    "AllFloorsData", new_afd_pk, timezone.now()
                 )
 
                 new_obj = AllFloorsCsvData(  # Use NEW model name
@@ -1068,9 +964,10 @@ class Command(BaseCommand):
                     scale_metric=scale_met,
                     scale_imperial=scale_imp,
                     calculated_sq_area_metric=calc_sq_met,
-                    calculated_floor_total_sq_area_metric=calc_floor_met,
                     calculated_area_imperial=calc_a_imp,
-                    calculated_floor_total_sq_area_imperial=calc_floor_imp,
+                    # Leave calculated_floor_total fields as None (or default if model has one)
+                    # calculated_floor_total_sq_area_metric=None,
+                    # calculated_floor_total_sq_area_imperial=None,
                     created_at=timestamp,
                     updated_at=timestamp,
                 )
@@ -1092,24 +989,37 @@ class Command(BaseCommand):
             f"Finished migrating AllFloorsCsvData. Processed:{total_processed}, SkipFK:{skipped_fk}"
         )
 
-    def migrate_totalareas(
-        self,
-        temp_db,
-        prod_db,
-        batch_size,
-        old_to_new_afd_pk_map,
-        analysis_creation_times,
-    ):
+    def migrate_totalareas(self, temp_db, prod_db, batch_size, old_to_new_afd_pk_map):
         """Migrates TotalAreasCsvData (renamed from TotalAreaData)."""
+        global TIMESTAMP_CACHE
         self.stdout.write(
             f"Migrating TotalAreasCsvData (from {OLD_TOTALAREA_TABLE})..."
         )
         total_processed = 0
         skipped_fk = 0
         ignored_dups = 0
+        # Check column name for pixels: was it total_pixels or total_actual_pixels in old table? Adjust SELECT accordingly.
+        # Assuming it was total_actual_pixels for now based on new model.
         query = f"SELECT id, all_floors_data_id, area_name, square_meters, square_feet, total_floors, total_named_rooms, total_segments, total_points, total_objects, total_door_objects, total_window_objects, total_stair_objects, list_of_objects, total_actual_pixels, metric_scale, imperial_scale, input_image_tokens, input_text_tokens, output_text_tokens FROM {OLD_TOTALAREA_TABLE} ORDER BY id"
         cursor = self._get_cursor(temp_db)
-        self._execute_query(cursor, query)
+        try:
+            self._execute_query(cursor, query)
+        except (
+            IntegrityError
+        ) as e:  # Handle potential missing column like total_actual_pixels
+            if "total_actual_pixels" in str(e):
+                logger.warning(
+                    f"Column 'total_actual_pixels' likely missing in old table {OLD_TOTALAREA_TABLE}. Trying without it."
+                )
+                query = f"SELECT id, all_floors_data_id, area_name, square_meters, square_feet, total_floors, total_named_rooms, total_segments, total_points, total_objects, total_door_objects, total_window_objects, total_stair_objects, list_of_objects, metric_scale, imperial_scale, input_image_tokens, input_text_tokens, output_text_tokens FROM {OLD_TOTALAREA_TABLE} ORDER BY id"
+                cursor = self._get_cursor(temp_db)
+                self._execute_query(cursor, query)
+                missing_pixel_col = True
+            else:
+                raise  # Re-raise other errors
+        else:
+            missing_pixel_col = False
+
         while True:
             rows = cursor.fetchmany(batch_size)
             if not rows:
@@ -1117,39 +1027,59 @@ class Command(BaseCommand):
             new_objs = []
             temp_map = {}
             for row in rows:
-                (
-                    old_pk,
-                    old_afd_pk,
-                    area_n,
-                    sqm,
-                    sqf,
-                    floors,
-                    rooms,
-                    seg,
-                    points,
-                    obj_tot,
-                    obj_d,
-                    obj_w,
-                    obj_s,
-                    list_o,
-                    pix,
-                    ms,
-                    iscale,
-                    in_img,
-                    in_txt,
-                    out_txt,
-                ) = row
+                if missing_pixel_col:
+                    (
+                        old_pk,
+                        old_afd_pk,
+                        area_n,
+                        sqm,
+                        sqf,
+                        floors,
+                        rooms,
+                        seg,
+                        points,
+                        obj_tot,
+                        obj_d,
+                        obj_w,
+                        obj_s,
+                        list_o,
+                        ms,
+                        iscale,
+                        in_img,
+                        in_txt,
+                        out_txt,
+                    ) = row
+                    pix = None  # Set pixels to None if column was missing
+                else:
+                    (
+                        old_pk,
+                        old_afd_pk,
+                        area_n,
+                        sqm,
+                        sqf,
+                        floors,
+                        rooms,
+                        seg,
+                        points,
+                        obj_tot,
+                        obj_d,
+                        obj_w,
+                        obj_s,
+                        list_o,
+                        pix,
+                        ms,
+                        iscale,
+                        in_img,
+                        in_txt,
+                        out_txt,
+                    ) = row
+
                 new_afd_pk = old_to_new_afd_pk_map.get(old_afd_pk)
                 if new_afd_pk is None:
                     skipped_fk += 1
                     continue
-                timestamp = self._get_parent_timestamp(
-                    "TotalAreasCsvData",
-                    old_afd_pk,
-                    AllFloorsData,
-                    old_to_new_afd_pk_map,
-                    analysis_creation_times,
-                    timezone.now(),
+                timestamp = self._get_timestamp_from_cache(
+                    "AllFloorsData", new_afd_pk, timezone.now()
                 )
 
                 obj = TotalAreasCsvData(  # Use NEW model name
@@ -1182,7 +1112,6 @@ class Command(BaseCommand):
                     created = TotalAreasCsvData.objects.using(prod_db).bulk_create(
                         new_objs, batch_size=batch_size, ignore_conflicts=True
                     )
-                    # Map PKs (match on FK + name?)
                     created_pks = {
                         (o.all_floors_data_id, o.area_name): o.pk
                         for o in TotalAreasCsvData.objects.using(prod_db)
@@ -1199,7 +1128,7 @@ class Command(BaseCommand):
                             (temp_obj.all_floors_data_id, temp_obj.area_name)
                         )
                         if new_pk:
-                            batch_proc += 1  # Don't need map for this leaf model
+                            batch_proc += 1
                         else:
                             ignored_dups += 1
                             logger.warning(

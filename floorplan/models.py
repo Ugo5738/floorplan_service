@@ -20,9 +20,14 @@ class FloorPlanAnalysisResult(TrackingModel):
 
     class Meta:
         unique_together = ("user_id", "property_id")
+        indexes = [
+            models.Index(fields=["user_id", "property_id"]),
+        ]
+        verbose_name = "Floor Plan Analysis Result"
+        verbose_name_plural = "Floor Plan Analysis Results"
 
     def __str__(self):
-        return f"{self.user_id} - {self.property_id}"
+        return f"Analysis: {self.user_id} - {self.property_id} (ID: {self.id})"
 
 
 class FloorPlan(TrackingModel):
@@ -34,13 +39,22 @@ class FloorPlan(TrackingModel):
         max_length=64,
         db_index=True,  # unique=True,
     )  # Ensures DB-level uniqueness and speeds up lookups
-    original_url = models.URLField(
-        max_length=1024
-    )  # Increase max_length for potentially long URLs
+    original_url = models.URLField(max_length=1024)
     update_count = models.PositiveIntegerField(
         default=0, help_text="Number of times webhook processing updated this record."
     )
     history = HistoricalRecords()
+
+    class Meta:
+        unique_together = ("analysis_result", "floorplan_id")
+        indexes = [
+            models.Index(
+                fields=["floorplan_id"]
+            ),  # Can keep this index too if needed for other lookups
+            # The unique_together constraint often implies an index anyway
+        ]
+        verbose_name = "Floor Plan"
+        verbose_name_plural = "Floor Plans"
 
     def __str__(self):
         # Show first 8 chars of hash for brevity in admin dropdowns etc.
@@ -48,7 +62,7 @@ class FloorPlan(TrackingModel):
         return f"FP Hash: {short_hash}... (Analysis: {self.analysis_result_id})"
 
     @staticmethod
-    def generate_hash_id(property_id, user_id, url):  # <-- Accept all three parts
+    def generate_hash_id(property_id, user_id, url):
         """
         Generates a SHA-256 hash for the combination of property ID, user ID,
         and URL string.
@@ -136,6 +150,9 @@ class CsvRoom(TrackingModel):
     """
 
     floor = models.ForeignKey(CsvFloor, on_delete=models.CASCADE, related_name="rooms")
+    # csv_floor = models.ForeignKey(
+    #     CsvFloor, on_delete=models.CASCADE, related_name="backup_rooms"
+    # )
     room_name = models.CharField(max_length=100, null=True, blank=True)
     is_segment = models.CharField(max_length=50, null=True, blank=True)
     room_id = models.FloatField(
@@ -167,6 +184,9 @@ class CsvRoomPixelData(TrackingModel):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="pixel_data"
     )
+    # csv_room = models.OneToOneField(
+    #     CsvRoom, on_delete=models.CASCADE, related_name="backup_pixel_data"
+    # )
     # Numeric fields from CSV for pixel positions and areas:
     min_x_pixels = models.FloatField(null=True, blank=True)  # Min X Pixels
     min_y_pixels = models.FloatField(null=True, blank=True)  # Min Y Pixels
@@ -193,6 +213,9 @@ class CsvRoomDimensions(TrackingModel):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="dimensions"
     )
+    # csv_room = models.OneToOneField(
+    #     CsvRoom, on_delete=models.CASCADE, related_name="backup_dimensions"
+    # )
     # Text fields for dimensions (Handles 'Unknown')
     dimensions_imperial = models.CharField(max_length=100, null=True, blank=True)
     dimensions_metric = models.CharField(max_length=100, null=True, blank=True)
@@ -202,12 +225,8 @@ class CsvRoomDimensions(TrackingModel):
     max_area_imperial = models.FloatField(null=True, blank=True)
 
     # Numeric fields for calculated areas:
-    calculated_sq_area_metric = models.FloatField(
-        null=True, blank=True
-    )  # Calculated Sq Area Metric
-    calculated_area_imperial = models.FloatField(
-        null=True, blank=True
-    )  # calculated_area_imperial
+    calculated_sq_area_metric = models.FloatField(null=True, blank=True)
+    calculated_area_imperial = models.FloatField(null=True, blank=True)
     history = HistoricalRecords()
 
     def __str__(self):
@@ -226,6 +245,9 @@ class CsvRoomScalingFactors(TrackingModel):
     room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="scaling_factors"
     )
+    # csv_room = models.OneToOneField(
+    #     CsvRoom, on_delete=models.CASCADE, related_name="backup_scaling_factors"
+    # )
     scale_metric = models.FloatField(null=True, blank=True)  # Scale Metric
     scale_imperial = models.FloatField(null=True, blank=True)  # Scale Imperial
     history = HistoricalRecords()
@@ -306,6 +328,7 @@ class AllFloorsCsvData(TrackingModel):
     )
 
     history = HistoricalRecords()
+    # history = HistoricalRecords(table_name="history_sdb_all_floors_csv_data")
 
     class Meta:
         verbose_name = "All Floors CSV Data"
@@ -345,9 +368,7 @@ class TotalAreasCsvData(TrackingModel):
     total_door_objects = models.IntegerField(null=True, blank=True)
     total_window_objects = models.IntegerField(null=True, blank=True)
     total_stair_objects = models.IntegerField(null=True, blank=True)
-    list_of_objects = models.TextField(
-        null=True, blank=True
-    )  # Store the list representation as text
+    list_of_objects = models.TextField(null=True, blank=True)
     total_actual_pixels = models.FloatField(null=True, blank=True)
     metric_scale = models.FloatField(null=True, blank=True)
     imperial_scale = models.FloatField(null=True, blank=True)
@@ -356,11 +377,13 @@ class TotalAreasCsvData(TrackingModel):
     output_text_tokens = models.IntegerField(null=True, blank=True)
 
     history = HistoricalRecords()
+    # history = HistoricalRecords(table_name="history_sdb_total_areas_csv_data")
 
     class Meta:
         # If you only expect one row per Area Name per AllFloorsData, enforce it
         unique_together = ("all_floors_data", "area_name")
-        verbose_name_plural = "Total Area Data"  # Nicer name in admin
+        verbose_name = "Total Area CSV Data"
+        verbose_name_plural = "Total Area CSV Data"
 
     def __str__(self):
         fp_id = (

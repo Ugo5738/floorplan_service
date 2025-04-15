@@ -32,9 +32,6 @@ DATABASES = {"default": dj_database_url.parse(default_db_url)}
 
 
 # --- Temporary Restore Database (PostgreSQL) ---
-# Use separate environment variables or hardcode for this temporary task
-# WARNING: Hardcoding credentials is NOT recommended for production settings.
-#          Use environment variables or secrets management.
 TEMP_RESTORE_DB_NAME = config(
     "TEMP_RESTORE_DB_NAME", default="floorplandb_temp_restore"
 )
