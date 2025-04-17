@@ -9,7 +9,7 @@ from django.db import IntegrityError, connections, transaction
 from django.utils import timezone
 
 # Import NEW models from your app
-from floorplan.models import (  # Use new names
+from floorplan.models import (
     AllFloorsCsvData,
     AllFloorsData,
     CsvFloor,
@@ -35,8 +35,8 @@ OLD_CSVROOM_TABLE = "floorplan_csvroom"
 OLD_CSVROOMPIXEL_TABLE = "floorplan_csvroompixeldata"
 OLD_CSVROOMDIM_TABLE = "floorplan_csvroomdimensions"
 OLD_CSVROOMSCALE_TABLE = "floorplan_csvroomscalingfactors"
-OLD_RAWROW_TABLE = "floorplan_allfloorscsvrawrow"
-OLD_TOTALAREA_TABLE = "floorplan_totalareadata"
+OLD_RAWROW_TABLE = "floorplan_allfloorscsvrawrow"  # Keep old name, assuming it's being mapped TO AllFloorsCsvData
+OLD_TOTALAREA_TABLE = "floorplan_totalareadata"  # Keep old name, assuming it's being mapped TO TotalAreasCsvData
 
 
 # --- Hashing function (matching the one in models.py) ---
@@ -160,9 +160,11 @@ class Command(BaseCommand):
                 self.migrate_csvroom_details(
                     temp_db, prod_db, batch_size, old_pk_maps["csvroom"]
                 )
+                # Assume old table OLD_RAWROW_TABLE maps to new AllFloorsCsvData
                 self.migrate_rawrows(
                     temp_db, prod_db, batch_size, old_pk_maps["allfloorsdata"]
                 )
+                # Assume old table OLD_TOTALAREA_TABLE maps to new TotalAreasCsvData
                 self.migrate_totalareas(
                     temp_db, prod_db, batch_size, old_pk_maps["allfloorsdata"]
                 )
@@ -677,6 +679,7 @@ class Command(BaseCommand):
         total_processed = 0
         skipped_fk = 0
         ignored_dups = 0
+        # Select the OLD foreign key column name "floor_id"
         query = f"SELECT id, floor_id, room_name, is_segment, room_id, no_of_doors, no_of_windows, no_of_room_points FROM {OLD_CSVROOM_TABLE} ORDER BY id"
         cursor = self._get_cursor(temp_db)
         self._execute_query(cursor, query)
@@ -689,7 +692,7 @@ class Command(BaseCommand):
             for row in rows:
                 (
                     old_pk,
-                    old_floor_pk,
+                    old_floor_pk,  # This is the OLD foreign key ID from the backup table
                     name,
                     is_seg,
                     room_id_val,
@@ -697,16 +700,21 @@ class Command(BaseCommand):
                     windows,
                     points,
                 ) = row
-                new_floor_pk = old_to_new_csvfloor_pk_map.get(old_floor_pk)
-                if new_floor_pk is None:
+                # Map the OLD CsvFloor PK to the NEW CsvFloor PK
+                new_csv_floor_pk = old_to_new_csvfloor_pk_map.get(old_floor_pk)
+                if new_csv_floor_pk is None:
                     skipped_fk += 1
                     continue
+
+                # Get the timestamp associated with the NEW CsvFloor PK
                 timestamp = self._get_timestamp_from_cache(
-                    "CsvFloor", new_floor_pk, timezone.now()
+                    "CsvFloor", new_csv_floor_pk, timezone.now()
                 )
 
+                # Create the CsvRoom instance using the NEW foreign key field name "csv_floor_id"
+                # and the mapped NEW PK value
                 obj = CsvRoom(
-                    floor_id=new_floor_pk,
+                    csv_floor_id=new_csv_floor_pk,  # Use NEW field name and NEW mapped PK
                     room_name=name,
                     is_segment=is_seg,
                     room_id=room_id_val,
@@ -717,33 +725,48 @@ class Command(BaseCommand):
                     updated_at=timestamp,
                 )
                 new_objs.append(obj)
-                temp_map[old_pk] = obj
+                temp_map[old_pk] = (
+                    obj  # Store the temp object keyed by the OLD CsvRoom PK
+                )
+
             if new_objs:
                 try:
+                    # Bulk create the new CsvRoom objects
                     created = CsvRoom.objects.using(prod_db).bulk_create(
                         new_objs, batch_size=batch_size, ignore_conflicts=True
                     )
-                    # Map PKs (match on floor_id + room_id?)
+
+                    # Re-query the created objects to get their NEW PKs, matching on the unique combination
+                    # of the NEW CsvFloor PK and the room_id.
                     created_pks = {
-                        (o.floor_id, o.room_id): (o.pk, o.created_at)
+                        # Key by the NEW csv_floor_id and room_id
+                        (o.csv_floor_id, o.room_id): (o.pk, o.created_at)
                         for o in CsvRoom.objects.using(prod_db)
-                        .filter(floor_id__in=[o.floor_id for o in new_objs])
-                        .only("pk", "floor_id", "room_id", "created_at")
+                        # Filter using the NEW foreign key field and the PKs we just inserted
+                        .filter(
+                            csv_floor_id__in=[o.csv_floor_id for o in new_objs]
+                        ).only("pk", "csv_floor_id", "room_id", "created_at")
                     }
                     batch_proc = 0
+                    # Map the OLD CsvRoom PK to the NEW CsvRoom PK
                     for old_pk, temp_obj in temp_map.items():
+                        # Find the NEW PK using the NEW csv_floor_id and room_id from the temp object
                         pk_ts_tuple = created_pks.get(
-                            (temp_obj.floor_id, temp_obj.room_id)
+                            (temp_obj.csv_floor_id, temp_obj.room_id)
                         )
                         if pk_ts_tuple:
                             new_pk, actual_ts = pk_ts_tuple
-                            old_to_new_pk[old_pk] = new_pk
-                            TIMESTAMP_CACHE["CsvRoom"][new_pk] = actual_ts
+                            old_to_new_pk[old_pk] = (
+                                new_pk  # Map: old CsvRoom PK -> new CsvRoom PK
+                            )
+                            TIMESTAMP_CACHE["CsvRoom"][
+                                new_pk
+                            ] = actual_ts  # Cache timestamp using NEW PK
                             batch_proc += 1
                         else:
                             ignored_dups += 1
                             logger.warning(
-                                f"CsvRoom old_pk={old_pk} skipped/ignored (duplicate floor/room_id?)."
+                                f"CsvRoom old_pk={old_pk} skipped/ignored (duplicate csv_floor/room_id?)."
                             )
                     total_processed += batch_proc
                     if batch_proc > 0:
@@ -767,9 +790,9 @@ class Command(BaseCommand):
             "Pixel": (
                 OLD_CSVROOMPIXEL_TABLE,
                 CsvRoomPixelData,
-                {
-                    "id": None,
-                    "room_id": "room_id",
+                {  # Map: Old DB Column Name -> New Model Field Name
+                    "id": None,  # Don't map primary key directly
+                    "room_id": "csv_room_id",  # OLD FK column -> NEW FK field _id
                     "min_x_pixels": "min_x_pixels",
                     "min_y_pixels": "min_y_pixels",
                     "max_x_pixels": "max_x_pixels",
@@ -782,9 +805,9 @@ class Command(BaseCommand):
             "Dimensions": (
                 OLD_CSVROOMDIM_TABLE,
                 CsvRoomDimensions,
-                {
+                {  # Map: Old DB Column Name -> New Model Field Name
                     "id": None,
-                    "room_id": "room_id",
+                    "room_id": "csv_room_id",  # OLD FK column -> NEW FK field _id
                     "dimensions_imperial": "dimensions_imperial",
                     "dimensions_metric": "dimensions_metric",
                     "max_area_metric": "max_area_metric",
@@ -796,9 +819,9 @@ class Command(BaseCommand):
             "Scaling": (
                 OLD_CSVROOMSCALE_TABLE,
                 CsvRoomScalingFactors,
-                {
+                {  # Map: Old DB Column Name -> New Model Field Name
                     "id": None,
-                    "room_id": "room_id",
+                    "room_id": "csv_room_id",  # OLD FK column -> NEW FK field _id
                     "scale_metric": "scale_metric",
                     "scale_imperial": "scale_imperial",
                 },
@@ -810,10 +833,13 @@ class Command(BaseCommand):
             total_processed = 0
             skipped_fk = 0
             ignored_dups = 0
-            old_cols_list = list(col_map.keys())  # Get ordered list of old columns
+            # Get the list of OLD column names to select from the backup DB
+            old_cols_list = list(col_map.keys())
             old_cols_str = ", ".join(
-                [f'"{c}"' for c in old_cols_list if c is not None]
-            )  # Select only mapped cols
+                [
+                    f'"{c}"' for c in old_cols_list if c is not None
+                ]  # Quote column names just in case
+            )
             query = f"SELECT {old_cols_str} FROM {old_table} ORDER BY id"
             cursor = self._get_cursor(temp_db)
             self._execute_query(cursor, query)
@@ -824,42 +850,52 @@ class Command(BaseCommand):
                     break
                 new_objs = []
                 for row in rows:
-                    # Map row values to a dict based on old_cols_list
+                    # Map row values to a dict based on old_cols_list order
                     old_data_dict = {
                         col_name: value for col_name, value in zip(old_cols_list, row)
                     }
-                    old_room_pk = old_data_dict.get(
-                        "room_id"
-                    )  # Get FK value using name
+                    # Get the OLD CsvRoom primary key from the backup data using the OLD column name 'room_id'
+                    old_room_pk = old_data_dict.get("room_id")
                     if old_room_pk is None:
-                        continue  # Should not happen if selected
+                        logger.warning(
+                            f"Missing room_id in old {name} data: {old_data_dict}"
+                        )
+                        continue  # Should not happen if selected correctly
 
+                    # Map the OLD CsvRoom PK to the NEW CsvRoom PK
                     new_room_pk = old_to_new_csvroom_pk_map.get(old_room_pk)
                     if new_room_pk is None:
                         skipped_fk += 1
                         continue
+
+                    # Get the timestamp associated with the NEW CsvRoom PK
                     timestamp = self._get_timestamp_from_cache(
                         "CsvRoom", new_room_pk, timezone.now()
                     )
 
+                    # Prepare data for the NEW model instance
                     data = {
-                        "room_id": new_room_pk,
+                        "csv_room_id": new_room_pk,  # Use the NEW foreign key field name and NEW PK value
                         "created_at": timestamp,
                         "updated_at": timestamp,
                     }
+                    # Map the remaining columns based on the col_map definition
                     for old_col, model_field_name in col_map.items():
-                        if (
-                            model_field_name and model_field_name != "room_id"
-                        ):  # Skip id, fk
+                        # If model_field_name is defined and it's not the FK we already set
+                        if model_field_name and model_field_name != "csv_room_id":
                             data[model_field_name] = old_data_dict.get(old_col)
 
                     new_objs.append(NewModel(**data))
+
                 if new_objs:
                     try:
+                        # Create new detail records, ignoring conflicts (e.g., if a room_id was duplicated in old data)
                         created = NewModel.objects.using(prod_db).bulk_create(
                             new_objs, batch_size=batch_size, ignore_conflicts=True
                         )
-                        total_processed += len(created)  # Count successful creations
+                        total_processed += len(
+                            created
+                        )  # Count actual successful creations
                         self.stdout.write(
                             f"    Processed {total_processed} {name} details..."
                         )
@@ -874,28 +910,43 @@ class Command(BaseCommand):
             )
 
     def migrate_rawrows(self, temp_db, prod_db, batch_size, old_to_new_afd_pk_map):
-        """Migrates AllFloorsCsvData (renamed from AllFloorsCsvRawRow)."""
+        """Migrates AllFloorsCsvData (renamed from AllFloorsCsvRawRow in old system)."""
         global TIMESTAMP_CACHE
         self.stdout.write(f"Migrating AllFloorsCsvData (from {OLD_RAWROW_TABLE})...")
         total_processed = 0
         skipped_fk = 0
         cursor = self._get_cursor(temp_db)
-        # Select ONLY columns that existed in the OLD raw table schema
-        # EXCLUDE calculated_floor_total_sq_area_metric and calculated_floor_total_sq_area_imperial
-        cursor.execute(
-            f"""
-             SELECT id, all_floors_data_id, floor_name, room_name, is_segment, room_id,
-                 no_of_door, no_of_window, no_of_room_points, min_x_pixels_csv, min_y_pixels_csv,
-                 max_x_pixels_csv, max_y_pixels_csv, dimensions_imperial, dimensions_metric,
-                 max_area_metric_csv, max_area_imperial_csv, max_area_pixels_csv,
-                 actual_area_pixels_csv, pixel_ratio_csv, scale_metric_csv, scale_imperial_csv,
-                 calculated_sq_area_metric_csv,
-                 -- calculated_floor_total_sq_area_metric, -- REMOVED
-                 calculated_area_imperial_csv
-                 -- calculated_floor_total_sq_area_imperial -- REMOVED
-             FROM {OLD_RAWROW_TABLE} ORDER BY id
-         """
-        )
+        # Select ONLY columns that existed in the OLD raw table schema (OLD_RAWROW_TABLE)
+        # This command assumes the structure of OLD_RAWROW_TABLE
+        # Ensure the SELECT list matches the columns in the backup table.
+        # If floor totals were added later to AllFloorsCsvData, they won't be in OLD_RAWROW_TABLE.
+        try:
+            cursor.execute(
+                f"""
+                 SELECT id, all_floors_data_id, floor_name, room_name, is_segment, room_id,
+                     no_of_door, no_of_window, no_of_room_points, min_x_pixels_csv, min_y_pixels_csv,
+                     max_x_pixels_csv, max_y_pixels_csv, dimensions_imperial, dimensions_metric,
+                     max_area_metric_csv, max_area_imperial_csv, max_area_pixels_csv,
+                     actual_area_pixels_csv, pixel_ratio_csv, scale_metric_csv, scale_imperial_csv,
+                     calculated_sq_area_metric_csv,
+                     -- If these existed in the old table, uncomment them:
+                     -- calculated_floor_total_sq_area_metric,
+                     calculated_area_imperial_csv
+                     -- calculated_floor_total_sq_area_imperial
+                 FROM {OLD_RAWROW_TABLE} ORDER BY id
+             """
+                # Note: The db_column names are used for select where specified in the NEW model.
+                # If the old table had different names, adjust the SELECT accordingly.
+            )
+            # Assuming floor totals might be missing in the old table based on previous version
+            has_floor_totals = False  # Adjust this if the above SELECT includes them
+        except Exception as e:
+            self.stderr.write(
+                self.style.ERROR(
+                    f" Error selecting from {OLD_RAWROW_TABLE}: {e}. Check SELECT statement against old table schema."
+                )
+            )
+            raise
 
         while True:
             old_rows = cursor.fetchmany(batch_size)
@@ -903,7 +954,8 @@ class Command(BaseCommand):
                 break
             new_objs = []
             for row in old_rows:
-                # Adjust tuple unpacking to match the reduced SELECT statement
+                # Adjust tuple unpacking based on the actual SELECT statement used
+                # This unpacking assumes floor totals were NOT selected
                 (
                     old_pk,
                     old_afd_pk,
@@ -928,10 +980,10 @@ class Command(BaseCommand):
                     scale_met,
                     scale_imp,
                     calc_sq_met,
-                    # Removed calc_floor_met
                     calc_a_imp,
-                    # Removed calc_floor_imp
                 ) = row
+                # If floor totals WERE selected, unpack them here:
+                # ..., calc_sq_met, calc_floor_met, calc_a_imp, calc_floor_imp) = row
 
                 new_afd_pk = old_to_new_afd_pk_map.get(old_afd_pk)
                 if new_afd_pk is None:
@@ -950,24 +1002,24 @@ class Command(BaseCommand):
                     no_of_door=no_of_door,
                     no_of_window=no_of_window,
                     no_of_room_points=no_of_room_points,
-                    min_x_pixels=min_x,
-                    min_y_pixels=min_y,
-                    max_x_pixels=max_x,
-                    max_y_pixels=max_y,
+                    min_x_pixels=min_x,  # Map to model field name
+                    min_y_pixels=min_y,  # Map to model field name
+                    max_x_pixels=max_x,  # Map to model field name
+                    max_y_pixels=max_y,  # Map to model field name
                     dimensions_imperial=dim_imp,
                     dimensions_metric=dim_met,
-                    max_area_metric=max_a_met,
-                    max_area_imperial=max_a_imp,
-                    max_area_pixels=max_a_pix,
-                    actual_area_pixels=act_a_pix,
-                    pixel_ratio=pix_ratio,
-                    scale_metric=scale_met,
-                    scale_imperial=scale_imp,
-                    calculated_sq_area_metric=calc_sq_met,
-                    calculated_area_imperial=calc_a_imp,
-                    # Leave calculated_floor_total fields as None (or default if model has one)
-                    # calculated_floor_total_sq_area_metric=None,
-                    # calculated_floor_total_sq_area_imperial=None,
+                    max_area_metric=max_a_met,  # Map to model field name
+                    max_area_imperial=max_a_imp,  # Map to model field name
+                    max_area_pixels=max_a_pix,  # Map to model field name
+                    actual_area_pixels=act_a_pix,  # Map to model field name
+                    pixel_ratio=pix_ratio,  # Map to model field name
+                    scale_metric=scale_met,  # Map to model field name
+                    scale_imperial=scale_imp,  # Map to model field name
+                    calculated_sq_area_metric=calc_sq_met,  # Map to model field name
+                    calculated_area_imperial=calc_a_imp,  # Map to model field name
+                    # If floor totals were selected and exist in the new model:
+                    # calculated_floor_total_sq_area_metric=calc_floor_met,
+                    # calculated_floor_total_sq_area_imperial=calc_floor_imp,
                     created_at=timestamp,
                     updated_at=timestamp,
                 )

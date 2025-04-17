@@ -138,6 +138,7 @@ class CsvRoomInline(admin.TabularInline):
     model = CsvRoom
     extra = 0
     fields = ("room_name", "is_segment", "room_id", "no_of_doors", "no_of_windows")
+    fk_name = "csv_floor"
 
 
 @admin.register(CsvFloor)
@@ -179,16 +180,19 @@ class CsvFloorAdmin(admin.ModelAdmin):
 
 class CsvRoomPixelDataInline(admin.StackedInline):
     model = CsvRoomPixelData
+    fk_name = "csv_room"
     extra = 0
 
 
 class CsvRoomDimensionsInline(admin.StackedInline):
     model = CsvRoomDimensions
+    fk_name = "csv_room"
     extra = 0
 
 
 class CsvRoomScalingFactorsInline(admin.StackedInline):
     model = CsvRoomScalingFactors
+    fk_name = "csv_room"
     extra = 0
 
 
@@ -202,11 +206,11 @@ class CsvRoomAdmin(admin.ModelAdmin):
         "no_of_doors",
         "no_of_windows",
     )
-    list_filter = ("is_segment", "floor__floor_name")
+    list_filter = ("is_segment", "csv_floor__floor_name")
     search_fields = (
         "room_name",
-        "floor__floor_name",
-        "floor__all_floors_data__floor_plan__floorplan_id",
+        "csv_floor__floor_name",
+        "csv_floor__all_floors_data__floor_plan__floorplan_id",
     )
     inlines = [
         CsvRoomPixelDataInline,
@@ -215,17 +219,17 @@ class CsvRoomAdmin(admin.ModelAdmin):
     ]
 
     def get_floor_name(self, obj):
-        return obj.floor.floor_name
+        return obj.csv_floor.floor_name
 
     get_floor_name.short_description = "Floor"
-    get_floor_name.admin_order_field = "floor__floor_name"
+    get_floor_name.admin_order_field = "csv_floor__floor_name"
 
     def get_floorplan_id(self, obj):
-        return obj.floor.all_floors_data.floor_plan.floorplan_id
+        return obj.csv_floor.all_floors_data.floor_plan.floorplan_id
 
     get_floorplan_id.short_description = "Floor Plan ID"
     get_floorplan_id.admin_order_field = (
-        "floor__all_floors_data__floor_plan__floorplan_id"
+        "csv_floor__all_floors_data__floor_plan__floorplan_id"
     )
 
 
@@ -241,19 +245,19 @@ class CsvRoomPixelDataAdmin(admin.ModelAdmin):
         "max_y_pixels",
         "actual_area_pixels",
     )
-    search_fields = ("room__room_name", "room__floor__floor_name")
+    search_fields = ("csv_room__room_name", "csv_room__csv_floor__floor_name")
 
     def get_room_name(self, obj):
-        return obj.room.room_name
+        return obj.csv_room.room_name
 
     get_room_name.short_description = "Room"
-    get_room_name.admin_order_field = "room__room_name"
+    get_room_name.admin_order_field = "csv_room__room_name"
 
     def get_floor_name(self, obj):
-        return obj.room.floor.floor_name
+        return obj.csv_room.csv_floor.floor_name
 
     get_floor_name.short_description = "Floor"
-    get_floor_name.admin_order_field = "room__floor__floor_name"
+    get_floor_name.admin_order_field = "csv_room__csv_floor__floor_name"
 
 
 @admin.register(CsvRoomDimensions)
@@ -266,19 +270,19 @@ class CsvRoomDimensionsAdmin(admin.ModelAdmin):
         "calculated_sq_area_metric",
         "calculated_area_imperial",
     )
-    search_fields = ("room__room_name", "room__floor__floor_name")
+    search_fields = ("csv_room__room_name", "csv_room__csv_floor__floor_name")
 
     def get_room_name(self, obj):
-        return obj.room.room_name
+        return obj.csv_room.room_name
 
     get_room_name.short_description = "Room"
-    get_room_name.admin_order_field = "room__room_name"
+    get_room_name.admin_order_field = "csv_room__room_name"
 
     def get_floor_name(self, obj):
-        return obj.room.floor.floor_name
+        return obj.csv_room.csv_floor.floor_name
 
     get_floor_name.short_description = "Floor"
-    get_floor_name.admin_order_field = "room__floor__floor_name"
+    get_floor_name.admin_order_field = "csv_room__csv_floor__floor_name"
 
 
 @admin.register(CsvRoomScalingFactors)
@@ -289,19 +293,19 @@ class CsvRoomScalingFactorsAdmin(admin.ModelAdmin):
         "scale_metric",
         "scale_imperial",
     )
-    search_fields = ("room__room_name", "room__floor__floor_name")
+    search_fields = ("csv_room__room_name", "csv_room__csv_floor__floor_name")
 
     def get_room_name(self, obj):
-        return obj.room.room_name
+        return obj.csv_room.room_name
 
     get_room_name.short_description = "Room"
-    get_room_name.admin_order_field = "room__room_name"
+    get_room_name.admin_order_field = "csv_room__room_name"
 
     def get_floor_name(self, obj):
-        return obj.room.floor.floor_name
+        return obj.csv_room.csv_floor.floor_name
 
     get_floor_name.short_description = "Floor"
-    get_floor_name.admin_order_field = "room__floor__floor_name"
+    get_floor_name.admin_order_field = "csv_room__csv_floor__floor_name"
 
 
 @admin.register(AllFloorsCsvData)

@@ -457,9 +457,6 @@ def process_floorplan_webhook(self, analysis_data):
         return {"error": f"Internal server error during webhook processing: {str(e)}"}
 
 
-# Removed _handle_creation_task and _handle_update_task as they are merged into process_floorplan_webhook
-
-
 def _process_single_floorplan_data(
     item_data, analysis_result, task_type, webhook_user_id, webhook_property_id
 ):
@@ -548,7 +545,6 @@ def _process_single_floorplan_data(
     floorplan_defaults = {
         "analysis_result": analysis_result,
         "original_url": source_url_for_db,
-        # updated_at is handled by TrackingModel/auto_now=True
         # update_count is handled below
     }
     try:
@@ -848,7 +844,7 @@ def process_structured_csv_data(rows, all_floors_data):
         # --- Get or Create CsvFloor ---
         if floor_name not in floor_cache:
             try:
-                floor, f_created = CsvFloor.objects.update_or_create(
+                csv_floor, f_created = CsvFloor.objects.update_or_create(
                     all_floors_data=all_floors_data,
                     floor_name=floor_name,
                     defaults={
@@ -860,7 +856,7 @@ def process_structured_csv_data(rows, all_floors_data):
                         ),
                     },
                 )
-                floor_cache[floor_name] = floor
+                floor_cache[floor_name] = csv_floor
             except Exception as e:
                 logger.error(
                     "Error getting/creating CsvFloor '%s' for AFD %d: %s",
@@ -870,7 +866,7 @@ def process_structured_csv_data(rows, all_floors_data):
                 )
                 continue  # Skip this row if floor cannot be processed
         else:
-            floor = floor_cache[floor_name]
+            csv_floor = floor_cache[floor_name]
 
         # --- Update or Create CsvRoom ---
         room_defaults = {
@@ -884,8 +880,8 @@ def process_structured_csv_data(rows, all_floors_data):
             # updated_at is handled by TrackingModel/auto_now=True
         }
         try:
-            room, r_created = CsvRoom.objects.update_or_create(
-                floor=floor,
+            csv_room, r_created = CsvRoom.objects.update_or_create(
+                csv_floor=csv_floor,
                 room_id=room_id,
                 defaults=room_defaults,
             )
@@ -901,12 +897,12 @@ def process_structured_csv_data(rows, all_floors_data):
 
         # --- Update or Create related room details ---
         try:
-            _update_or_create_room_details(room, row)
+            _update_or_create_room_details(csv_room, row)
         except Exception as detail_e:
             logger.error(
                 "Error processing details for CsvRoom ID %s (PK %d): %s",
                 room_id,
-                room.pk,
+                csv_room.pk,
                 detail_e,
             )
             # Continue to next row even if details fail
@@ -948,7 +944,7 @@ def process_structured_csv_data(rows, all_floors_data):
     )
 
 
-def _update_or_create_room_details(room, row_data):
+def _update_or_create_room_details(csv_room, row_data):
     """Helper to update/create related OneToOne room details."""
     # --- Pixel Data ---
     pixel_defaults = {
@@ -965,14 +961,16 @@ def _update_or_create_room_details(room, row_data):
         k: v for k, v in pixel_defaults.items() if v is not None
     }  # Keep only non-None values
     if pixel_defaults:  # Only process if there's actual data
-        CsvRoomPixelData.objects.update_or_create(room=room, defaults=pixel_defaults)
+        CsvRoomPixelData.objects.update_or_create(
+            csv_room=csv_room, defaults=pixel_defaults
+        )
     else:
         # If all values were None or missing, delete existing record if it exists
-        deleted_count, _ = CsvRoomPixelData.objects.filter(room=room).delete()
+        deleted_count, _ = CsvRoomPixelData.objects.filter(csv_room=csv_room).delete()
         if deleted_count:
             logger.debug(
                 "Deleted CsvRoomPixelData for room %d as all input values were None/missing.",
-                room.id,
+                csv_room.id,
             )
 
     # --- Dimensions ---
@@ -992,33 +990,34 @@ def _update_or_create_room_details(room, row_data):
     dimension_defaults = {k: v for k, v in dimension_defaults.items() if v is not None}
     if dimension_defaults:
         CsvRoomDimensions.objects.update_or_create(
-            room=room, defaults=dimension_defaults
+            csv_room=csv_room, defaults=dimension_defaults
         )
     else:
-        deleted_count, _ = CsvRoomDimensions.objects.filter(room=room).delete()
+        deleted_count, _ = CsvRoomDimensions.objects.filter(csv_room=csv_room).delete()
         if deleted_count:
             logger.debug(
                 "Deleted CsvRoomDimensions for room %d as all input values were None/missing.",
-                room.id,
+                csv_room.id,
             )
 
     # --- Scaling Factors ---
     scaling_defaults = {
         "scale_metric": safe_float(row_data.get("Scale Metric")),
         "scale_imperial": safe_float(row_data.get("Scale Imperial")),
-        # updated_at is handled by TrackingModel/auto_now=True
     }
     scaling_defaults = {k: v for k, v in scaling_defaults.items() if v is not None}
     if scaling_defaults:
         CsvRoomScalingFactors.objects.update_or_create(
-            room=room, defaults=scaling_defaults
+            csv_room=csv_room, defaults=scaling_defaults
         )
     else:
-        deleted_count, _ = CsvRoomScalingFactors.objects.filter(room=room).delete()
+        deleted_count, _ = CsvRoomScalingFactors.objects.filter(
+            csv_room=csv_room
+        ).delete()
         if deleted_count:
             logger.debug(
                 "Deleted CsvRoomScalingFactors for room %d as all input values were None/missing.",
-                room.id,
+                csv_room.id,
             )
 
 

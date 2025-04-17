@@ -149,10 +149,9 @@ class CsvRoom(TrackingModel):
     Represents each room (row) in the CSV file.
     """
 
-    floor = models.ForeignKey(CsvFloor, on_delete=models.CASCADE, related_name="rooms")
-    # csv_floor = models.ForeignKey(
-    #     CsvFloor, on_delete=models.CASCADE, related_name="backup_rooms"
-    # )
+    csv_floor = models.ForeignKey(
+        CsvFloor, on_delete=models.CASCADE, related_name="rooms"
+    )
     room_name = models.CharField(max_length=100, null=True, blank=True)
     is_segment = models.CharField(max_length=50, null=True, blank=True)
     room_id = models.FloatField(
@@ -165,11 +164,11 @@ class CsvRoom(TrackingModel):
 
     class Meta:
         # Ensure room_id is unique within a specific CsvFloor
-        unique_together = ("floor", "room_id")
+        unique_together = ("csv_floor", "room_id")
 
     def __str__(self):
         try:
-            floor_name = self.floor.floor_name or "Unnamed Floor"
+            floor_name = self.csv_floor.floor_name or "Unnamed Floor"
         except CsvFloor.DoesNotExist:
             floor_name = "Detached Floor"
         room_name = self.room_name or f"Unnamed Room (ID: {self.id})"
@@ -181,12 +180,9 @@ class CsvRoomPixelData(TrackingModel):
     Stores the pixel-specific data for each room from the CSV.
     """
 
-    room = models.OneToOneField(
+    csv_room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="pixel_data"
     )
-    # csv_room = models.OneToOneField(
-    #     CsvRoom, on_delete=models.CASCADE, related_name="backup_pixel_data"
-    # )
     # Numeric fields from CSV for pixel positions and areas:
     min_x_pixels = models.FloatField(null=True, blank=True)  # Min X Pixels
     min_y_pixels = models.FloatField(null=True, blank=True)  # Min Y Pixels
@@ -199,7 +195,7 @@ class CsvRoomPixelData(TrackingModel):
 
     def __str__(self):
         try:
-            room_name = self.room.room_name or f"Unnamed Room (ID: {self.room.id})"
+            room_name = self.csv_room.room_name or f"Unnamed Room (ID: {self.room.id})"
             return f"Pixel Data for {room_name}"
         except CsvRoom.DoesNotExist:
             return f"Pixel Data for Detached Room (ID: {self.id})"
@@ -210,12 +206,9 @@ class CsvRoomDimensions(TrackingModel):
     Stores dimension and area details for each room.
     """
 
-    room = models.OneToOneField(
+    csv_room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="dimensions"
     )
-    # csv_room = models.OneToOneField(
-    #     CsvRoom, on_delete=models.CASCADE, related_name="backup_dimensions"
-    # )
     # Text fields for dimensions (Handles 'Unknown')
     dimensions_imperial = models.CharField(max_length=100, null=True, blank=True)
     dimensions_metric = models.CharField(max_length=100, null=True, blank=True)
@@ -231,7 +224,9 @@ class CsvRoomDimensions(TrackingModel):
 
     def __str__(self):
         try:
-            room_name = self.room.room_name or f"Unnamed Room (ID: {self.room.id})"
+            room_name = (
+                self.csv_room.room_name or f"Unnamed Room (ID: {self.csv_room.id})"
+            )
             return f"Dimensions for {room_name}"
         except CsvRoom.DoesNotExist:
             return f"Dimensions for Detached Room (ID: {self.id})"
@@ -242,19 +237,18 @@ class CsvRoomScalingFactors(TrackingModel):
     Stores scaling factors for metric and imperial measurements.
     """
 
-    room = models.OneToOneField(
+    csv_room = models.OneToOneField(
         CsvRoom, on_delete=models.CASCADE, related_name="scaling_factors"
     )
-    # csv_room = models.OneToOneField(
-    #     CsvRoom, on_delete=models.CASCADE, related_name="backup_scaling_factors"
-    # )
     scale_metric = models.FloatField(null=True, blank=True)  # Scale Metric
     scale_imperial = models.FloatField(null=True, blank=True)  # Scale Imperial
     history = HistoricalRecords()
 
     def __str__(self):
         try:
-            room_name = self.room.room_name or f"Unnamed Room (ID: {self.room.id})"
+            room_name = (
+                self.csv_room.room_name or f"Unnamed Room (ID: {self.csv_room.id})"
+            )
             return f"Scaling Factors for {room_name}"
         except CsvRoom.DoesNotExist:
             return f"Scaling Factors for Detached Room (ID: {self.id})"
@@ -328,7 +322,6 @@ class AllFloorsCsvData(TrackingModel):
     )
 
     history = HistoricalRecords()
-    # history = HistoricalRecords(table_name="history_sdb_all_floors_csv_data")
 
     class Meta:
         verbose_name = "All Floors CSV Data"
@@ -377,7 +370,6 @@ class TotalAreasCsvData(TrackingModel):
     output_text_tokens = models.IntegerField(null=True, blank=True)
 
     history = HistoricalRecords()
-    # history = HistoricalRecords(table_name="history_sdb_total_areas_csv_data")
 
     class Meta:
         # If you only expect one row per Area Name per AllFloorsData, enforce it
