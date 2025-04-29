@@ -730,7 +730,7 @@ def _download_csv_content(csv_url, context_msg):
         return response.text
     except requests.Timeout:
         logger.error("Timeout downloading CSV for %s from %s", context_msg, csv_url)
-        return None
+        raise ConnectionError(f"Timeout downloading CSV for {context_msg}")
     except requests.RequestException as e:
         status_code = getattr(e.response, "status_code", "N/A")
         logger.error(
@@ -740,7 +740,9 @@ def _download_csv_content(csv_url, context_msg):
             str(e),
             status_code,
         )
-        return None
+        raise ConnectionError(
+            f"Failed download CSV for {context_msg}: Status {status_code}"
+        )
 
 
 def _process_main_csv(all_floors_data):
@@ -1131,6 +1133,12 @@ def process_raw_csv_rows(rows, all_floors_data, fieldnames):
 
 def _process_total_area_csv(all_floors_data):
     """Downloads and processes the total_area.csv."""
+    if not all_floors_data or not all_floors_data.pk:
+        logger.error("Invalid AllFloorsData instance passed to _process_total_area_csv")
+        raise ValueError(
+            "Invalid AllFloorsData instance"
+        )  # Raise error to signal failure
+
     total_area_csv_url = all_floors_data.total_area_csv_url
     context_msg = f"total_area.csv for AllFloorsData ID {all_floors_data.id} (FloorPlan: {all_floors_data.floor_plan.floorplan_id})"
     csv_content = _download_csv_content(total_area_csv_url, context_msg)
@@ -1179,9 +1187,7 @@ def _process_total_area_csv(all_floors_data):
                     "total_window_objects": safe_int(row.get("Total Window Objects")),
                     "total_stair_objects": safe_int(row.get("Total Stair Objects")),
                     "list_of_objects": safe_string(row.get("List of Objects")),
-                    "total_actual_pixels": safe_float(
-                        row.get("Total Actual Pixels")
-                    ),  # Check header name
+                    "total_actual_pixels": safe_float(row.get("Total Pixels")),
                     "metric_scale": safe_float(row.get("Metric Scale")),
                     "imperial_scale": safe_float(row.get("Imperial Scale")),
                     "input_image_tokens": safe_int(row.get("Input Image Tokens")),

@@ -2132,6 +2132,462 @@ class FloorPlanWebhookView(APIView):
 # floorplan/management/__init__.py
 
 
+# floorplan/management/commands/check_sdb_consistency.py
+# floorplan/management/commands/check_sdb_consistency.py
+import time
+
+import requests
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db import connections
+from django.db.utils import OperationalError
+
+# We need a way to represent the SDB FloorPlan model.
+# Easiest way IF sdb is installed as an app (unlikely): from sdb.models import FloorPlan as FloorPlanBackup
+# Alternative: Raw SQL or define a stub model if needed.
+# Let's try querying via alias directly.
+from requests.exceptions import RequestException
+
+# Import models from BOTH apps (assuming sdb models are accessible somehow,
+# or we query raw SQL, or we define simplified stub models here).
+# For simplicity, let's assume we query floorplan_id and updated_at from both.
+from floorplan.models import FloorPlan as FloorPlanSource
+from floorplan.utils.backup import serialize_floorplan_for_sdb  # For re-sync
+from floorplan_service.config.logging_config import configure_logger
+
+logger = configure_logger(__name__)
+
+
+class Command(BaseCommand):
+    help = "Compares FloorPlan records between the source (default) and SDB backup databases."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            help="Limit the number of records fetched from the source DB for comparison.",
+        )
+        parser.add_argument(
+            "--check-updated",
+            action="store_true",
+            help="Compare the updated_at timestamp for matching records.",
+        )
+        parser.add_argument(
+            "--fix-missing",
+            action="store_true",
+            help="Attempt to sync records found in source DB but missing in SDB.",
+        )
+        parser.add_argument(
+            "--api-url",
+            type=str,
+            default=None,
+            help="Override the SDB API URL from settings (needed for --fix-missing).",
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=0.1,
+            help="Delay in seconds between API calls if using --fix-missing.",
+        )
+
+    def handle(self, *args, **options):
+        limit = options["limit"]
+        check_updated = options["check_updated"]
+        fix_missing = options["fix_missing"]
+        api_url_override = options["api_url"]
+        delay = options["delay"]
+
+        source_db = "default"
+        backup_db = "sdb_backup"
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"--- Starting Consistency Check: '{source_db}' vs '{backup_db}' ---"
+            )
+        )
+
+        # Check if backup DB alias exists
+        if backup_db not in settings.DATABASES:
+            raise CommandError(
+                f"Database alias '{backup_db}' not found in settings. "
+                f"Ensure it's configured correctly (e.g., in settings/dev.py)."
+            )
+
+        # Test connections
+        try:
+            connections[source_db].ensure_connection()
+            self.stdout.write(f"Connected to source DB '{source_db}'")
+            connections[backup_db].ensure_connection()
+            self.stdout.write(f"Connected to backup DB '{backup_db}'")
+        except OperationalError as e:
+            raise CommandError(f"Database connection error: {e}")
+        except Exception as e:
+            raise CommandError(f"Unexpected error checking DB connection: {e}")
+
+        if fix_missing:
+            if api_url_override:
+                sdb_api_url = api_url_override.rstrip("/") + "/api/sdb/floorplan/"
+            else:
+                base_url = getattr(settings, "BACKUP_SERVICE_URL", None)
+                if not base_url:
+                    raise CommandError(
+                        "BACKUP_SERVICE_URL must be configured in settings to use --fix-missing."
+                    )
+                sdb_api_url = base_url.rstrip("/") + "/api/sdb/floorplan/"
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Auto-fix enabled. Will POST missing records to {sdb_api_url}"
+                )
+            )
+
+        # --- Fetch IDs and Timestamps ---
+        self.stdout.write("Fetching data from source database...")
+        source_data_qs = FloorPlanSource.objects.using(source_db).values(
+            "floorplan_id", "updated_at", "pk"
+        )
+        if limit:
+            source_data_qs = source_data_qs[:limit]
+        source_data = {
+            item["floorplan_id"]: {"updated_at": item["updated_at"], "pk": item["pk"]}
+            for item in source_data_qs
+        }
+        self.stdout.write(f"Fetched {len(source_data)} records from source.")
+
+        self.stdout.write("Fetching data from SDB backup database...")
+        try:
+            # Querying FloorPlan model using the backup alias
+            # Important: Assumes 'sdb.models.FloorPlan' exists and mirrors the structure enough for this query
+            # If not, raw SQL might be needed, or adjust the import/model definition.
+            # This requires the 'sdb' app models to be available in the floorplan environment,
+            # which might not be ideal. Let's query directly using the source model definition
+            # but targeting the backup DB. This relies on the table name being correct
+            # in the backup DB (sdb_floorplans).
+
+            backup_data_qs = (
+                FloorPlanSource.objects.using(backup_db)
+                .filter(
+                    floorplan_id__in=source_data.keys()  # Optimization: Only check IDs present in source
+                )
+                .values("floorplan_id", "updated_at")
+            )
+
+            backup_data = {
+                item["floorplan_id"]: {"updated_at": item["updated_at"]}
+                for item in backup_data_qs
+            }
+            self.stdout.write(
+                f"Fetched {len(backup_data)} matching records from SDB backup."
+            )
+
+        except Exception as e:
+            raise CommandError(
+                f"Error querying backup DB '{backup_db}'. Does table 'sdb_floorplans' exist and match the model? Error: {e}"
+            )
+
+        # --- Compare Data ---
+        missing_in_backup = []
+        updated_mismatch = []
+
+        for fp_id, source_info in source_data.items():
+            if fp_id not in backup_data:
+                missing_in_backup.append((fp_id, source_info["pk"]))
+            elif check_updated:
+                backup_info = backup_data[fp_id]
+                # Compare timestamps (naive comparison, timezone might matter)
+                if source_info["updated_at"] > backup_info["updated_at"]:
+                    # Add a tolerance (e.g., 1 second) if needed
+                    # if abs(source_info["updated_at"] - backup_info["updated_at"]).total_seconds() > 1:
+                    updated_mismatch.append(
+                        (
+                            fp_id,
+                            source_info["updated_at"],
+                            backup_info["updated_at"],
+                        )
+                    )
+
+        # --- Report Results ---
+        self.stdout.write("\n--- Consistency Report ---")
+        if not missing_in_backup and not updated_mismatch:
+            self.stdout.write(
+                self.style.SUCCESS("All checked records appear consistent.")
+            )
+        else:
+            if missing_in_backup:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"\nFound {len(missing_in_backup)} records missing in SDB Backup:"
+                    )
+                )
+                for fp_id, source_pk in missing_in_backup[:20]:  # Show first 20
+                    self.stdout.write(
+                        f"  - Floorplan ID: {fp_id} (Source PK: {source_pk})"
+                    )
+                if len(missing_in_backup) > 20:
+                    self.stdout.write(f"  ... and {len(missing_in_backup) - 20} more.")
+
+                if fix_missing:
+                    self.stdout.write(
+                        self.style.WARNING("\nAttempting to fix missing records...")
+                    )
+                    fix_success = 0
+                    fix_error = 0
+                    for fp_id, source_pk in missing_in_backup:
+                        try:
+                            self.stdout.write(
+                                f"  Syncing {fp_id} (Source PK: {source_pk})...",
+                                ending="",
+                            )
+                            source_instance = FloorPlanSource.objects.using(
+                                source_db
+                            ).get(pk=source_pk)
+                            payload = serialize_floorplan_for_sdb(source_instance)
+                            if payload:
+                                response = requests.post(
+                                    sdb_api_url, json=payload, timeout=30
+                                )
+                                response.raise_for_status()
+                                self.stdout.write(
+                                    self.style.SUCCESS(
+                                        f" [OK - Status: {response.status_code}]"
+                                    )
+                                )
+                                fix_success += 1
+                            else:
+                                self.stdout.write(
+                                    self.style.WARNING(" [Serialization Failed]")
+                                )
+                                fix_error += 1
+
+                            if delay > 0:
+                                time.sleep(delay)
+
+                        except FloorPlanSource.DoesNotExist:
+                            self.stdout.write(
+                                self.style.ERROR(" [Source Record Vanished?]")
+                            )
+                            fix_error += 1
+                        except RequestException as e:
+                            self.stdout.write(self.style.ERROR(f" [API Error: {e}]"))
+                            logger.error(f"Fix Error for {fp_id}: {e}", exc_info=True)
+                            fix_error += 1
+                        except Exception as e:
+                            self.stdout.write(
+                                self.style.ERROR(f" [Unexpected Fix Error: {e}]")
+                            )
+                            logger.error(
+                                f"Unexpected Fix Error for {fp_id}: {e}", exc_info=True
+                            )
+                            fix_error += 1
+                    self.stdout.write(
+                        f"Fix attempts complete. Success: {fix_success}, Errors: {fix_error}"
+                    )
+
+            if updated_mismatch:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"\nFound {len(updated_mismatch)} records with newer 'updated_at' in Source:"
+                    )
+                )
+                for fp_id, source_ts, backup_ts in updated_mismatch[
+                    :20
+                ]:  # Show first 20
+                    self.stdout.write(
+                        f"  - Floorplan ID: {fp_id} (Source: {source_ts}, Backup: {backup_ts})"
+                    )
+                if len(updated_mismatch) > 20:
+                    self.stdout.write(f"  ... and {len(updated_mismatch) - 20} more.")
+                if not fix_missing:
+                    self.stdout.write(
+                        self.style.NOTICE(
+                            "  (Run with --fix-missing to attempt re-sync for missing records)"
+                        )
+                    )
+
+        self.stdout.write(self.style.SUCCESS("\n--- Consistency Check Complete ---"))
+
+
+# floorplan/management/commands/sync_all_to_sdb.py
+# floorplan/management/commands/sync_all_to_sdb.py
+import time
+
+import requests
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Prefetch
+from requests.exceptions import RequestException
+
+from floorplan.models import FloorPlan  # Import source model
+
+# Import the SDB serialization function
+from floorplan.utils.backup import serialize_floorplan_for_sdb
+
+# Assuming you have your logger configured
+from floorplan_service.config.logging_config import configure_logger
+
+logger = configure_logger(__name__)
+
+
+class Command(BaseCommand):
+    help = "Synchronizes all existing FloorPlan data from this service to the SDB backup service API."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--batch-size",
+            type=int,
+            default=50,
+            help="Number of FloorPlans to process before logging progress.",
+        )
+        parser.add_argument(
+            "--start-pk",
+            type=int,
+            default=None,
+            help="Optional primary key to start processing from.",
+        )
+        parser.add_argument(
+            "--api-url",
+            type=str,
+            default=None,
+            help="Override the SDB API URL from settings.",
+        )
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Simulate the process without actually sending data.",
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=0.1,
+            help="Delay in seconds between API calls to avoid overwhelming the SDB service.",
+        )
+
+    def handle(self, *args, **options):
+        batch_size = options["batch_size"]
+        start_pk = options["start_pk"]
+        api_url_override = options["api_url"]
+        dry_run = options["dry_run"]
+        delay = options["delay"]
+
+        if api_url_override:
+            sdb_api_url = api_url_override.rstrip("/") + "/api/backup/floorplan/"
+        else:
+            base_url = getattr(settings, "BACKUP_SERVICE_URL", None)
+            if not base_url:
+                raise CommandError("BACKUP_SERVICE_URL is not configured in settings.")
+            sdb_api_url = base_url.rstrip("/") + "/api/backup/floorplan/"
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"--- Starting Initial FloorPlan Sync to SDB ({sdb_api_url}) ---"
+            )
+        )
+        if dry_run:
+            self.stdout.write(
+                self.style.WARNING("DRY RUN enabled. No data will be sent.")
+            )
+
+        # Queryset optimization: Prefetch related data needed for serialization
+        queryset = (
+            FloorPlan.objects.all()
+            .select_related("analysis_result")
+            .prefetch_related(
+                "all_floors_data",
+                "all_floors_data__csv_floors__rooms__pixel_data",
+                "all_floors_data__csv_floors__rooms__dimensions",
+                "all_floors_data__csv_floors__rooms__scaling_factors",
+                "all_floors_data__all_floors_csv_data",
+                "all_floors_data__total_areas_csv_data",
+                "plan_floors",
+            )
+            .order_by("pk")
+        )  # Order for predictable processing
+
+        if start_pk:
+            queryset = queryset.filter(pk__gte=start_pk)
+            self.stdout.write(f"Starting processing from PK >= {start_pk}")
+
+        total_count = queryset.count()
+        self.stdout.write(f"Found {total_count} FloorPlan records to process.")
+
+        processed_count = 0
+        success_count = 0
+        error_count = 0
+
+        for floorplan in queryset.iterator():
+            processed_count += 1
+            self.stdout.write(
+                f"Processing FloorPlan PK={floorplan.pk}, ID={floorplan.floorplan_id} ({processed_count}/{total_count})...",
+                ending="",
+            )
+
+            try:
+                payload = serialize_floorplan_for_sdb(floorplan)
+                if payload is None:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            " Serialization failed (see logs). Skipping."
+                        )
+                    )
+                    error_count += 1
+                    continue
+
+                if dry_run:
+                    # Simulate success in dry run if serialization worked
+                    self.stdout.write(self.style.SUCCESS(" [DRY RUN - OK]"))
+                    success_count += 1
+                else:
+                    # Make the actual API call
+                    try:
+                        response = requests.post(sdb_api_url, json=payload, timeout=30)
+                        response.raise_for_status()  # Check for HTTP errors
+
+                        self.stdout.write(
+                            self.style.SUCCESS(
+                                f" [OK - Status: {response.status_code}]"
+                            )
+                        )
+                        success_count += 1
+
+                    except RequestException as e:
+                        self.stdout.write(self.style.ERROR(f" [Error: {e}]"))
+                        logger.error(
+                            f"Failed to sync FloorPlan PK={floorplan.pk}: {e}",
+                            exc_info=True,
+                        )
+                        # Log response details if available
+                        if hasattr(e, "response") and e.response is not None:
+                            logger.error(f"Response status: {e.response.status_code}")
+                            logger.error(
+                                f"Response text: {e.response.text[:500]}"
+                            )  # Log snippet
+                        error_count += 1
+                    # Optional delay
+                    if delay > 0:
+                        time.sleep(delay)
+
+            except Exception as e:
+                # Catch unexpected errors during serialization or loop logic
+                self.stdout.write(self.style.ERROR(f" [Unexpected Error: {e}]"))
+                logger.exception(
+                    f"Unexpected error processing FloorPlan PK={floorplan.pk}: {e}"
+                )
+                error_count += 1
+
+            if processed_count % batch_size == 0:
+                self.stdout.write(
+                    f"\nProcessed {processed_count}/{total_count}. Success: {success_count}, Errors: {error_count}\n"
+                )
+
+        self.stdout.write(self.style.SUCCESS(f"\n--- Sync Complete ---"))
+        self.stdout.write(f"Total Processed: {processed_count}")
+        self.stdout.write(self.style.SUCCESS(f"Successful Syncs: {success_count}"))
+        self.stdout.write(self.style.ERROR(f"Errors: {error_count}"))
+
+        if error_count > 0:
+            self.stdout.write(self.style.WARNING("Check logs for details on errors."))
+
+
 # floorplan/management/commands/export_floorplan_data.py
 # floorplan/management/commands/export_floorplan_data.py
 
@@ -2427,7 +2883,752 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(f"Finished CSV 3: Exported {count} rows."))
 
 
+# floorplan/management/commands/deduplicate_floorplans.py
+# floorplan/management/commands/deduplicate_floorplans.py
+
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+from django.db.models import Count, F, Max
+
+from floorplan.models import FloorPlan, FloorPlanAnalysisResult
+
+
+class Command(BaseCommand):
+    help = (
+        "Identifies and deletes older duplicate FloorPlan records for the same "
+        "FloorPlanAnalysisResult (user_id, property_id pair), keeping only the most recent one."
+    )
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Identify duplicates and what would be deleted, but don't actually delete anything.",
+        )
+        parser.add_argument(
+            "--keep-field",
+            type=str,
+            default="updated_at",
+            choices=[
+                "updated_at",
+                "created_at",
+                "pk",
+            ],  # pk uses highest primary key as "most recent"
+            help="Field to use to determine the 'most recent' FloorPlan record to keep ('updated_at', 'created_at', or 'pk').",
+        )
+
+    @transaction.atomic  # Wrap the whole process in a transaction
+    def handle(self, *args, **options):
+        dry_run = options["dry_run"]
+        keep_field = options["keep_field"]
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"--- Starting FloorPlan Deduplication (Keep based on most recent '{keep_field}') ---"
+            )
+        )
+        if dry_run:
+            self.stdout.write(
+                self.style.WARNING("DRY RUN enabled. No records will be deleted.")
+            )
+
+        # 1. Find FloorPlanAnalysisResult IDs with more than one FloorPlan
+        analysis_results_with_duplicates = (
+            FloorPlanAnalysisResult.objects.annotate(
+                floorplan_count=Count(
+                    "floor_plans"
+                )  # Use the related_name from FloorPlan.analysis_result
+            )
+            .filter(floorplan_count__gt=1)
+            .values_list("id", flat=True)
+        )
+
+        duplicate_analysis_ids = list(analysis_results_with_duplicates)
+        total_analysis_duplicates = len(duplicate_analysis_ids)
+
+        if not total_analysis_duplicates:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "No duplicate FloorPlans found based on Analysis Results."
+                )
+            )
+            return
+
+        self.stdout.write(
+            f"Found {total_analysis_duplicates} Analysis Results with multiple FloorPlans."
+        )
+
+        total_deleted_count = 0
+        processed_analysis_count = 0
+
+        # 2. Iterate through each analysis result with duplicates
+        for analysis_id in duplicate_analysis_ids:
+            processed_analysis_count += 1
+            if processed_analysis_count % 50 == 0:
+                self.stdout.write(
+                    f"  Processed {processed_analysis_count}/{total_analysis_duplicates} analysis results..."
+                )
+
+            # Get all floorplans for this analysis result
+            floorplans_for_analysis = FloorPlan.objects.filter(
+                analysis_result_id=analysis_id
+            )
+
+            # 3. Determine the most recent FloorPlan to keep
+            try:
+                # Use Max aggregation on the chosen field to find the "latest" value
+                latest_value_data = floorplans_for_analysis.aggregate(
+                    latest_value=Max(keep_field)
+                )
+                latest_value = latest_value_data.get("latest_value")
+
+                if latest_value is None:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"  Could not determine latest value for AnalysisResult ID {analysis_id}. Skipping."
+                        )
+                    )
+                    continue
+
+                # Find the specific FloorPlan(s) that match the latest value.
+                # It's possible (though less likely with timestamps) multiple have the exact same latest value.
+                # In that case, we arbitrarily keep the one with the highest PK among those tied.
+                floorplans_to_keep_qs = floorplans_for_analysis.filter(
+                    **{keep_field: latest_value}  # Filter by the latest value found
+                ).order_by(
+                    "-pk"
+                )  # Order by PK descending
+
+                if not floorplans_to_keep_qs.exists():
+                    self.stdout.write(
+                        self.style.ERROR(
+                            f"  Logic error: Could not find FloorPlan to keep for AnalysisResult ID {analysis_id} with latest value {latest_value}. Skipping."
+                        )
+                    )
+                    continue
+
+                floorplan_to_keep = (
+                    floorplans_to_keep_qs.first()
+                )  # Get the one with the highest PK among those with the latest value
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.ERROR(
+                        f"  Error determining FloorPlan to keep for AnalysisResult ID {analysis_id}: {e}. Skipping."
+                    )
+                )
+                continue
+
+            # 4. Identify FloorPlans to delete (all except the one to keep)
+            floorplans_to_delete = floorplans_for_analysis.exclude(
+                pk=floorplan_to_keep.pk
+            )
+            delete_pks = list(floorplans_to_delete.values_list("pk", flat=True))
+            delete_count = len(delete_pks)
+
+            if delete_count > 0:
+                self.stdout.write(
+                    f"  AnalysisResult ID {analysis_id}: Keeping FloorPlan PK {floorplan_to_keep.pk} (based on '{keep_field}'), planning to delete {delete_count} older records (PKs: {delete_pks})."
+                )
+
+                if not dry_run:
+                    try:
+                        deleted_count_actual, deleted_details = (
+                            floorplans_to_delete.delete()
+                        )
+                        self.stdout.write(
+                            self.style.SUCCESS(
+                                f"    Successfully deleted {deleted_count_actual} records."
+                            )
+                        )
+                        # logger.debug(f"Deletion details for AnalysisResult {analysis_id}: {deleted_details}") # Optional more detail
+                        total_deleted_count += deleted_count_actual
+                    except Exception as e:
+                        self.stdout.write(
+                            self.style.ERROR(
+                                f"    Error deleting records for AnalysisResult ID {analysis_id}: {e}"
+                            )
+                        )
+                        # Since we're in a transaction, this will cause a rollback unless caught differently
+                        raise CommandError(
+                            f"Failed during deletion for AnalysisResult ID {analysis_id}"
+                        )  # Stop execution on error
+
+            else:
+                self.stdout.write(
+                    f"  AnalysisResult ID {analysis_id}: No older records to delete."
+                )
+
+        self.stdout.write(self.style.SUCCESS("\n--- Deduplication Complete ---"))
+        if dry_run:
+            self.stdout.write(
+                self.style.WARNING("DRY RUN completed. No records were deleted.")
+            )
+            # You might want to report the *potential* delete count here if needed
+        else:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Total older duplicate FloorPlan records deleted: {total_deleted_count}"
+                )
+            )
+
+
 # floorplan/management/commands/__init__.py
+
+
+# floorplan/management/commands/check_sdb_fp_consistency.py
+# floorplan/management/commands/check_sdb_fp_consistency.py
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db.models import CharField, Value
+from django.utils.dateparse import parse_datetime
+from requests.exceptions import RequestException
+
+# Import THIS service's models and utils
+from floorplan.models import FloorPlan, FloorPlanAnalysisResult
+from floorplan.utils.backup import serialize_floorplan_for_sdb
+
+# Import logger from THIS service
+from floorplan_service.config.logging_config import configure_logger
+
+logger = configure_logger(__name__)
+
+
+# --- Helper to fetch paginated data from SDB API ---
+def fetch_paginated_sdb_data(
+    api_url, data_key="results", id_field="primary_key", fields=None
+):
+    """Fetches all data from a paginated SDB check endpoint."""
+    data = {}
+    next_url = api_url
+    page_num = 1
+    logger.info(f"Fetching paginated SDB data from {api_url}...")
+    retrieved_count = 0
+
+    while next_url:
+        try:
+            logger.debug(
+                f"Fetching SDB page {page_num} from {next_url}"
+            )  # More detailed logging
+            response = requests.get(next_url, timeout=30)  # Increased timeout
+            response.raise_for_status()
+            page_data = response.json()
+
+            results = page_data.get(data_key, [])
+            if not results:
+                logger.debug("No results in page data.")
+                break  # Stop if no results on a page
+
+            for item in results:
+                key = item.get(id_field)
+                if key is not None:
+                    # Only store requested fields if specified
+                    data[key] = {f: item.get(f) for f in fields} if fields else item
+                    retrieved_count += 1
+                else:
+                    logger.warning(
+                        f"Warning: SDB Item missing ID field '{id_field}': {item}"
+                    )
+
+            next_url = page_data.get("next")
+            if next_url:
+                page_num += 1
+            # time.sleep(0.05) # Optional delay between pages
+
+        except RequestException as e:
+            logger.error(f"SDB API request failed for {next_url or api_url}: {e}")
+            if hasattr(e, "response") and e.response is not None:
+                logger.error(
+                    f"Response status: {e.response.status_code}, Body: {e.response.text[:200]}"
+                )
+            return None  # Indicate failure
+        except Exception as e:
+            logger.error(
+                f"Error processing paginated SDB data from {next_url or api_url}: {e}"
+            )
+            return None  # Indicate failure
+
+    logger.info(f"Finished fetching SDB data. Total records mapped: {len(data)}")
+    return data
+
+
+class Command(BaseCommand):
+    help = "Checks Floorplan data consistency (Results & Plans) between Floorplan service and the SDB aggregate database via APIs."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--staleness-threshold-hours", type=int, default=24)
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            help="Limit source records checked PER MODEL.",
+        )
+        parser.add_argument("--fix-missing", action="store_true")
+        parser.add_argument("--fix-mismatched", action="store_true")
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--delay", type=float, default=0.1)
+
+    def handle(self, *args, **options):
+        staleness_threshold = timedelta(hours=options["staleness_threshold_hours"])
+        limit = options["limit"]
+        fix_missing = options["fix_missing"]
+        fix_mismatched = options["fix_mismatched"]
+        dry_run = options["dry_run"]
+        delay = options["delay"]
+
+        self.stdout.write(
+            self.style.SUCCESS("--- Starting Floorplan -> SDB Consistency Check ---")
+        )
+        if dry_run:
+            self.stdout.write(self.style.WARNING("DRY RUN mode enabled."))
+
+        # Get SDB Base URL from this service's settings
+        sdb_base_url = getattr(settings, "BACKUP_SERVICE_URL", None)
+        if not sdb_base_url:
+            raise CommandError(
+                "BACKUP_SERVICE_URL (pointing to SDB service) is not configured in Floorplan settings."
+            )
+        sdb_base_url = sdb_base_url.rstrip("/")
+
+        # --- Define Checks ---
+        # SDB Fix URL is the same for both, as Floorplan payload includes AnalysisResult
+        sdb_fix_url = f"{sdb_base_url}/api/sdb/floorplan/"
+        can_fix = (fix_missing or fix_mismatched) and not dry_run
+        if can_fix:
+            self.stdout.write(self.style.WARNING("\nFixing enabled."))
+
+        overall_summary = {}
+
+        # --- Check FloorPlanAnalysisResult ---
+        self.stdout.write(
+            self.style.MIGRATE_HEADING("\n--- Checking FloorPlanAnalysisResult ---")
+        )
+        fpa_summary = self._check_fpa_results(
+            limit,
+            staleness_threshold,
+            fix_missing,
+            fix_mismatched,
+            dry_run,
+            sdb_base_url
+            + "/api/sdb/check/fp-analysis-results/",  # Requires this endpoint in SDB
+            sdb_fix_url,
+            delay,
+        )
+        overall_summary["FloorPlanAnalysisResult"] = fpa_summary
+
+        # --- Check FloorPlan ---
+        # (Potentially skip if FPA results had major issues)
+        # We need the mapping from FPA check if we need to trigger fixes based on FP mismatch
+        self.stdout.write(self.style.MIGRATE_HEADING("\n--- Checking FloorPlan ---"))
+        fp_summary = self._check_floorplans(
+            limit,
+            staleness_threshold,
+            fix_missing,
+            fix_mismatched,
+            dry_run,
+            sdb_base_url
+            + "/api/sdb/check/floorplans/",  # Requires this endpoint in SDB
+            sdb_fix_url,
+            delay,
+        )
+        overall_summary["FloorPlan"] = fp_summary
+
+        # --- Final Summary ---
+        self.stdout.write(
+            self.style.SUCCESS("\n--- Overall Floorplan Check Summary ---")
+        )
+        for model_key, summary in overall_summary.items():
+            self.stdout.write(f"{model_key}:")
+            for key, value in summary.items():
+                style = (
+                    self.style.SUCCESS
+                    if value == 0 or key.startswith("source") or key.startswith("sdb")
+                    else self.style.WARNING
+                )
+                self.stdout.write(
+                    style(f"  {key.replace('_', ' ').capitalize()}: {value}")
+                )
+            if summary.get("fix_api_errors", 0) > 0:
+                self.stdout.write(
+                    self.style.ERROR("  Fixing API errors occurred. Check logs.")
+                )
+
+    def _check_fpa_results(
+        self,
+        limit,
+        staleness_threshold,
+        fix_missing,
+        fix_mismatched,
+        dry_run,
+        sdb_check_url,
+        sdb_fix_url,
+        delay,
+    ):
+        """Checks FloorPlanAnalysisResult consistency."""
+        summary = self._initialize_summary()
+        source_model = FloorPlanAnalysisResult
+        src_pk_field = "id"
+
+        # Fetch Source FPA Results
+        self.stdout.write(
+            "Fetching data from source Floorplan DB (FloorPlanAnalysisResult)..."
+        )
+        source_data = {}
+        try:
+            source_qs = source_model.objects.using("default").order_by(src_pk_field)
+            if limit:
+                source_qs = source_qs[:limit]
+            source_values = source_qs.values(
+                src_pk_field, "updated_at", "user_id", "property_id"
+            )
+            for item in source_values.iterator():
+                # Use composite key for matching as SDB might not store source PK directly for FPAResult
+                key = f"{item['user_id']}|{item['property_id']}"
+                source_data[key] = item
+            summary["source_records_checked"] = len(source_data)
+            self.stdout.write(
+                f"Fetched {summary['source_records_checked']} records from source."
+            )
+        except Exception as e:
+            self.stderr.write(
+                self.style.ERROR(f"Error fetching source FPA Results: {e}")
+            )
+            summary["errors_fetching_source"] += 1
+            return summary
+
+        # Fetch SDB FPA Results via API
+        self.stdout.write(
+            f"Fetching corresponding FPA Result data from SDB API: {sdb_check_url} ..."
+        )
+        sdb_api_fields = [
+            "unique_id",
+            "updated_at",
+            "id",
+        ]  # SDB Check API should return unique_id and SDB PK ('id')
+        sdb_data_raw = fetch_paginated_sdb_data(
+            sdb_check_url, id_field="unique_id", fields=sdb_api_fields
+        )
+        if sdb_data_raw is None:
+            summary["errors_fetching_sdb"] += 1
+            return summary
+        summary["sdb_records_found"] = len(sdb_data_raw)
+        self.stdout.write(
+            f"Fetched {summary['sdb_records_found']} records from SDB API."
+        )
+
+        # Compare FPA Results
+        missing_pks_to_fix = (
+            []
+        )  # Store SOURCE PKs of FPA Results whose FloorPlan needs resync
+        mismatched_pks_to_fix = []
+        now_aware = timezone.now()
+
+        source_pks_by_unique_key = {
+            f"{d['user_id']}|{d['property_id']}": d[src_pk_field]
+            for d in source_data.values()
+        }
+
+        for unique_key, source_item in source_data.items():
+            sdb_item = sdb_data_raw.get(unique_key)
+            source_pk = source_item[src_pk_field]
+
+            if sdb_item is None:
+                summary["missing_in_sdb"] += 1
+                missing_pks_to_fix.append(source_pk)  # Mark for fix
+            else:
+                source_updated = source_item.get("updated_at")
+                sdb_updated_str = sdb_item.get("updated_at")
+                sdb_updated = (
+                    parse_datetime(sdb_updated_str) if sdb_updated_str else None
+                )
+                if sdb_updated and not sdb_updated.tzinfo:
+                    sdb_updated = timezone.make_aware(sdb_updated, timezone.utc)
+
+                if source_updated and sdb_updated and source_updated > sdb_updated:
+                    if (now_aware - sdb_updated) > staleness_threshold:
+                        summary["potentially_stale_update"] += 1
+                        mismatched_pks_to_fix.append(source_pk)  # Mark for fix
+                        self.stdout.write(
+                            f"\n  Potentially Stale FPA Result for Source PK {source_pk} (Key: {unique_key}): Source={source_updated}, SDB={sdb_updated}"
+                        )
+
+        # --- Trigger Fixes (by re-syncing the *entire* FloorPlan linked to the FPA Result) ---
+        can_fix = (fix_missing or fix_mismatched) and not dry_run
+        pks_to_fix = set(missing_pks_to_fix + mismatched_pks_to_fix)
+
+        if can_fix and pks_to_fix:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"\nAttempting to trigger re-sync for {len(pks_to_fix)} FloorPlans due to FPA Result discrepancies..."
+                )
+            )
+            for source_fpa_pk in pks_to_fix:
+                # Find the *most recent* FloorPlan associated with this FPA Result in the source DB
+                # This assumes the latest FP reflects the state that *should* be in SDB
+                source_fp_to_fix = (
+                    FloorPlan.objects.using("default")
+                    .filter(analysis_result_id=source_fpa_pk)
+                    .order_by("-updated_at")
+                    .first()
+                )
+                if source_fp_to_fix:
+                    if self._fix_floorplan_api(
+                        source_fp_to_fix.pk,
+                        serialize_floorplan_for_sdb,
+                        sdb_fix_url,
+                        delay,
+                        dry_run,
+                    ):
+                        if source_fpa_pk in missing_pks_to_fix:
+                            summary["fixes_attempted_missing"] += 1
+                        if source_fpa_pk in mismatched_pks_to_fix:
+                            summary["fixes_attempted_mismatched"] += 1
+                    else:
+                        summary["fix_api_errors"] += 1
+                else:
+                    self.stderr.write(
+                        self.style.ERROR(
+                            f"  Cannot fix FPA PK {source_fpa_pk}: No corresponding FloorPlan found in source DB."
+                        )
+                    )
+                    summary["fix_api_errors"] += 1  # Count as error
+
+        return summary
+
+    def _check_floorplans(
+        self,
+        limit,
+        staleness_threshold,
+        fix_missing,
+        fix_mismatched,
+        dry_run,
+        sdb_check_url,
+        sdb_fix_url,
+        delay,
+    ):
+        """Checks FloorPlan consistency."""
+        summary = self._initialize_summary()
+        source_model = FloorPlan
+        src_pk_field = "id"
+        source_unique_field = "floorplan_id"  # Use the hash for matching
+
+        # Fetch Source FloorPlans
+        self.stdout.write("Fetching data from source Floorplan DB (FloorPlan)...")
+        source_data = {}
+        try:
+            source_qs = source_model.objects.using("default").order_by(src_pk_field)
+            if limit:
+                source_qs = source_qs[:limit]
+            # Fetch fields needed for comparison and the source PK for fixing
+            source_values = source_qs.values(
+                src_pk_field, source_unique_field, "updated_at", "update_count"
+            )
+            for item in source_values.iterator():
+                source_data[item[source_unique_field]] = (
+                    item  # Key by floorplan_id hash
+                )
+            summary["source_records_checked"] = len(source_data)
+            self.stdout.write(
+                f"Fetched {summary['source_records_checked']} records from source."
+            )
+        except Exception as e:
+            self.stderr.write(
+                self.style.ERROR(f"Error fetching source FloorPlans: {e}")
+            )
+            summary["errors_fetching_source"] += 1
+            return summary
+
+        # Fetch SDB FloorPlans via API
+        self.stdout.write(
+            f"Fetching corresponding FloorPlan data from SDB API: {sdb_check_url} ..."
+        )
+        # Ask SDB check API for floorplan_id, updated_at, update_count
+        sdb_api_fields = ["floorplan_id", "updated_at", "update_count"]
+        sdb_data_raw = fetch_paginated_sdb_data(
+            sdb_check_url, id_field="floorplan_id", fields=sdb_api_fields
+        )
+        if sdb_data_raw is None:
+            summary["errors_fetching_sdb"] += 1
+            return summary
+        summary["sdb_records_found"] = len(sdb_data_raw)
+        self.stdout.write(
+            f"Fetched {summary['sdb_records_found']} records from SDB API."
+        )
+        # SDB data is already keyed by floorplan_id
+
+        # Compare FloorPlans
+        missing_pks_to_fix = []  # Store SOURCE PKs
+        mismatched_pks_to_fix = []
+        now_aware = timezone.now()
+
+        for fp_hash, source_item in source_data.items():
+            sdb_item = sdb_data_raw.get(fp_hash)
+            source_pk = source_item[src_pk_field]
+
+            if sdb_item is None:
+                summary["missing_in_sdb"] += 1
+                missing_pks_to_fix.append(source_pk)
+            else:
+                stale = False
+                content_diff = False
+                # Compare updated_at
+                source_updated = source_item.get("updated_at")
+                sdb_updated_str = sdb_item.get("updated_at")
+                sdb_updated = (
+                    parse_datetime(sdb_updated_str) if sdb_updated_str else None
+                )
+                if sdb_updated and not sdb_updated.tzinfo:
+                    sdb_updated = timezone.make_aware(sdb_updated, timezone.utc)
+
+                if source_updated and sdb_updated and source_updated > sdb_updated:
+                    if (now_aware - sdb_updated) > staleness_threshold:
+                        stale = True
+                        self.stdout.write(
+                            f"\n  Potentially Stale FloorPlan {fp_hash} (PK {source_pk}): Source={source_updated}, SDB={sdb_updated}"
+                        )
+
+                # Compare update_count
+                source_uc = source_item.get("update_count")
+                sdb_uc = sdb_item.get("update_count")
+                if source_uc != sdb_uc:  # Simple comparison
+                    content_diff = True
+                    self.stdout.write(
+                        f"\n  Update Count Mismatch for FloorPlan {fp_hash} (PK {source_pk}): Source={source_uc}, SDB={sdb_uc}"
+                    )
+
+                if stale or content_diff:
+                    summary["potentially_stale_or_mismatched"] += 1
+                    mismatched_pks_to_fix.append(source_pk)
+
+        # --- Trigger Fixes (by re-syncing the *entire* FloorPlan) ---
+        can_fix = (fix_missing or fix_mismatched) and not dry_run
+        pks_to_fix = set(missing_pks_to_fix + mismatched_pks_to_fix)
+
+        if can_fix and pks_to_fix:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"\nAttempting to trigger re-sync for {len(pks_to_fix)} FloorPlans..."
+                )
+            )
+            for source_fp_pk in pks_to_fix:
+                if self._fix_floorplan_api(
+                    source_fp_pk,
+                    serialize_floorplan_for_sdb,
+                    sdb_fix_url,
+                    delay,
+                    dry_run,
+                ):
+                    if source_fp_pk in missing_pks_to_fix:
+                        summary["fixes_attempted_missing"] += 1
+                    if source_fp_pk in mismatched_pks_to_fix:
+                        summary["fixes_attempted_mismatched"] += 1
+                else:
+                    summary["fix_api_errors"] += 1
+        return summary
+
+    def _initialize_summary(self):
+        """Returns a dictionary to store check results."""
+        return {
+            "source_records_checked": 0,
+            "sdb_records_found": 0,
+            "missing_in_sdb": 0,
+            "potentially_stale_update": 0,
+            "content_mismatched": 0,  # Keep track if specific content differs
+            "errors_fetching_source": 0,
+            "errors_fetching_sdb": 0,
+            "fixes_attempted_missing": 0,
+            "fixes_attempted_mismatched": 0,
+            "fix_api_errors": 0,
+        }
+
+    def _fix_floorplan_api(
+        self, source_pk, serialize_func, sdb_fix_url, delay, dry_run
+    ):
+        """Fetches source FloorPlan, serializes (including nested), and POSTs to SDB."""
+        # This helper reuses the logic from the Property fix, adapted for FloorPlan
+        if dry_run:
+            self.stdout.write(
+                f"\n  [DRY RUN] Would trigger fix for FloorPlan PK {source_pk} -> {sdb_fix_url}"
+            )
+            return True
+
+        if not sdb_fix_url or not serialize_func:
+            self.stderr.write(
+                self.style.ERROR(
+                    f"  Cannot fix FloorPlan PK {source_pk}: API endpoint or serialize function not configured."
+                )
+            )
+            return False
+        try:
+            # Fetch the full instance with prefetched data for serialization
+            instance = (
+                FloorPlan.objects.using("default")
+                .select_related("analysis_result")
+                .prefetch_related(
+                    "all_floors_data",
+                    "all_floors_data__csv_floors__rooms__pixel_data",
+                    "all_floors_data__csv_floors__rooms__dimensions",
+                    "all_floors_data__csv_floors__rooms__scaling_factors",
+                    "all_floors_data__all_floors_csv_data",
+                    "all_floors_data__total_areas_csv_data",
+                    "plan_floors",
+                )
+                .get(pk=source_pk)
+            )
+
+            payload = serialize_func(instance)
+
+            if payload is None:
+                self.stderr.write(
+                    self.style.ERROR(
+                        f"  Serialization failed for FloorPlan PK {source_pk}. Cannot fix."
+                    )
+                )
+                return False
+
+            self.stdout.write(
+                f"\n  Attempting POST fix for FloorPlan PK {source_pk} to {sdb_fix_url}..."
+            )
+            response = requests.post(
+                sdb_fix_url, json=payload, timeout=60
+            )  # Longer timeout for complex payload
+            response.raise_for_status()
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"    Fix successful (Status: {response.status_code})."
+                )
+            )
+            if delay > 0:
+                time.sleep(delay)
+            return True
+
+        except FloorPlan.DoesNotExist:
+            self.stderr.write(
+                self.style.ERROR(
+                    f"  Cannot fix FloorPlan PK {source_pk}: Record not found in source DB anymore."
+                )
+            )
+            return False
+        except RequestException as e:
+            self.stderr.write(
+                self.style.ERROR(f"  API Error fixing FloorPlan PK {source_pk}: {e}")
+            )
+            if hasattr(e, "response") and e.response is not None:
+                logger.error(f"  Fix API Response status: {e.response.status_code}")
+                logger.error(f"  Fix API Response text: {e.response.text[:500]}")
+            return False
+        except Exception as e:
+            self.stderr.write(
+                self.style.ERROR(
+                    f"  Unexpected error fixing FloorPlan PK {source_pk}: {e}"
+                )
+            )
+            logger.exception(f"Unexpected error fixing FloorPlan PK {source_pk}")
+            return False
 
 
 # floorplan/management/commands/restore_floorplan_data.py
@@ -3634,221 +4835,286 @@ class Command(BaseCommand):
 
 
 # floorplan/utils/backup.py
+# floorplan/utils/backup.py
 import requests
 from django.conf import settings
 from django.forms.models import model_to_dict
 
+# Assuming you have your logger configured
 from floorplan_service.config.logging_config import configure_logger
 
 logger = configure_logger(__name__)
 
 
-def backup_floorplan(instance):
-    try:
-        logger.info(
-            "Starting backup process for FloorPlan ID: %s", instance.floorplan_id
+# --- Helper function to serialize for SDB ---
+# This encapsulates the logic to create the payload expected by the SDB service
+def serialize_floorplan_for_sdb(instance):
+    """
+    Serializes a FloorPlan instance and its related data into the structure
+    expected by the CompletesdbFloorPlanSerializer in the sdb service.
+    """
+    if not instance or not instance.analysis_result:
+        logger.warning(
+            "Cannot serialize floorplan for SDB: Invalid instance or missing analysis_result."
         )
-        # Build the analysis result payload (exclude auto fields)
-        analysis_result_payload = {
-            "message": instance.analysis_result.message,
-            "user_id": instance.analysis_result.user_id,
-            "property_id": instance.analysis_result.property_id,
+        return None
+
+    # Build the analysis result payload
+    analysis_result_payload = {
+        "message": instance.analysis_result.message,
+        "user_id": instance.analysis_result.user_id,
+        "property_id": instance.analysis_result.property_id,
+        # Include created_at/updated_at if needed by the SDB serializer, otherwise omit
+        # "created_at": instance.analysis_result.created_at.isoformat() if instance.analysis_result.created_at else None,
+        # "updated_at": instance.analysis_result.updated_at.isoformat() if instance.analysis_result.updated_at else None,
+    }
+
+    # Base payload for the FloorPlan itself
+    payload = {
+        "analysis_result": analysis_result_payload,
+        "floorplan_id": instance.floorplan_id,
+        "original_url": instance.original_url,
+        "update_count": instance.update_count,
+        # Initialize nested structures with 'sdb_' prefix expected by the receiver
+        "sdb_all_floors_data": None,
+        "sdb_plan_floors": [],
+    }
+
+    # Build the AllFloorsData payload if available.
+    if hasattr(instance, "all_floors_data") and instance.all_floors_data:
+        all_floors = instance.all_floors_data
+        all_floors_payload = {
+            "json_file_url": all_floors.json_file_url,
+            "csv_url": all_floors.csv_url,
+            "total_area_csv_url": all_floors.total_area_csv_url,
+            "image_labelme_side_by_side_url": all_floors.image_labelme_side_by_side_url,
+            "notes": all_floors.notes,
+            # Initialize lists for nested structures with 'sdb_' prefix
+            "sdb_csv_floors": [],
+            "all_floors_csv_data": [],  # Match SDB serializer field name
+            "total_areas_csv_data": [],  # Match SDB serializer field name
         }
 
-        # Build the main floorplan payload – only required fields.
-        payload = {
-            "analysis_result": analysis_result_payload,
-            "floorplan_id": instance.floorplan_id,
-            "original_url": instance.original_url,
-        }
-
-        # Build the AllFloorsData payload if available.
-        if hasattr(instance, "all_floors_data") and instance.all_floors_data:
-            all_floors = instance.all_floors_data
-            all_floors_payload = {
-                "json_file_url": all_floors.json_file_url,
-                "csv_url": all_floors.csv_url,
-                "total_area_csv_url": all_floors.total_area_csv_url,
-                "image_labelme_side_by_side_url": all_floors.image_labelme_side_by_side_url,
-                "notes": all_floors.notes,
-                # Initialize lists for nested structures
-                "backup_csv_floors": [],
-                "backup_all_floors_csv_data": [],  # <-- Initialize raw rows list
-                "backup_total_areas_csv_data": [],  # <-- Initialize total area list (if backing up)
+        # Process Structured CSV floors (CsvFloor, CsvRoom, etc.)
+        csv_floors_list = []
+        for csv_floor in all_floors.csv_floors.all().prefetch_related(
+            "rooms", "rooms__pixel_data", "rooms__dimensions", "rooms__scaling_factors"
+        ):  # Prefetch for efficiency
+            csv_floor_payload = {
+                "floor_name": csv_floor.floor_name,
+                "calculated_total_area_metric": csv_floor.calculated_total_area_metric,
+                "calculated_total_area_imperial": csv_floor.calculated_total_area_imperial,
+                "sdb_rooms": [],  # Use 'sdb_' prefix
             }
-
-            # Process Structured CSV floors (CsvFloor, CsvRoom, etc.)
-            csv_floors_list = []
-            for csv_floor in all_floors.csv_floors.all():
-                csv_floor_payload = {
-                    "floor_name": csv_floor.floor_name,
-                    "calculated_total_area_metric": csv_floor.calculated_total_area_metric,
-                    "calculated_total_area_imperial": csv_floor.calculated_total_area_imperial,
+            rooms_list = []
+            for room in csv_floor.rooms.all():
+                room_payload = {
+                    "room_name": room.room_name,
+                    "is_segment": room.is_segment,
+                    "room_id": room.room_id,
+                    "no_of_doors": room.no_of_doors,
+                    "no_of_windows": room.no_of_windows,
+                    "no_of_room_points": room.no_of_room_points,
+                    # Initialize nested detail structures
+                    "sdb_pixel_data": None,
+                    "sdb_dimensions": None,
+                    "sdb_scaling_factors": None,
                 }
-                rooms_list = []
-                for room in csv_floor.rooms.all():
-                    room_payload = {
-                        "room_name": room.room_name,
-                        "is_segment": room.is_segment,
-                        "room_id": room.room_id,
-                        "no_of_doors": room.no_of_doors,
-                        "no_of_windows": room.no_of_windows,
-                        "no_of_room_points": room.no_of_room_points,
+                # Include pixel data if available
+                if hasattr(room, "pixel_data") and room.pixel_data:
+                    pd = room.pixel_data
+                    room_payload["sdb_pixel_data"] = {  # Use 'sdb_' prefix
+                        "min_x_pixels": pd.min_x_pixels,
+                        "min_y_pixels": pd.min_y_pixels,
+                        "max_x_pixels": pd.max_x_pixels,
+                        "max_y_pixels": pd.max_y_pixels,
+                        "max_area_pixels": pd.max_area_pixels,
+                        "actual_area_pixels": pd.actual_area_pixels,
+                        "pixel_ratio": pd.pixel_ratio,
                     }
-                    # Include pixel data if available
-                    if hasattr(room, "pixel_data"):
-                        pd = room.pixel_data
-                        room_payload["backup_pixel_data"] = {
-                            "min_x_pixels": pd.min_x_pixels,
-                            "min_y_pixels": pd.min_y_pixels,
-                            "max_x_pixels": pd.max_x_pixels,
-                            "max_y_pixels": pd.max_y_pixels,
-                            "max_area_pixels": pd.max_area_pixels,
-                            "actual_area_pixels": pd.actual_area_pixels,
-                            "pixel_ratio": pd.pixel_ratio,
-                        }
-                    # Include dimensions if available
-                    if hasattr(room, "dimensions"):
-                        dims = room.dimensions
-                        room_payload["backup_dimensions"] = {
-                            "dimensions_imperial": dims.dimensions_imperial,
-                            "dimensions_metric": dims.dimensions_metric,
-                            "max_area_metric": dims.max_area_metric,
-                            "max_area_imperial": dims.max_area_imperial,
-                            "calculated_sq_area_metric": dims.calculated_sq_area_metric,
-                            "calculated_area_imperial": dims.calculated_area_imperial,
-                        }
-                    # Include scaling factors if available
-                    if hasattr(room, "scaling_factors"):
-                        sf = room.scaling_factors
-                        room_payload["backup_scaling_factors"] = {
-                            "scale_metric": sf.scale_metric,
-                            "scale_imperial": sf.scale_imperial,
-                        }
-                    rooms_list.append(room_payload)
-                csv_floor_payload["backup_rooms"] = rooms_list
-                csv_floors_list.append(csv_floor_payload)
-            all_floors_payload["backup_csv_floors"] = csv_floors_list
-            payload["backup_all_floors_data"] = all_floors_payload
+                # Include dimensions if available
+                if hasattr(room, "dimensions") and room.dimensions:
+                    dims = room.dimensions
+                    room_payload["sdb_dimensions"] = {  # Use 'sdb_' prefix
+                        "dimensions_imperial": dims.dimensions_imperial,
+                        "dimensions_metric": dims.dimensions_metric,
+                        "max_area_metric": dims.max_area_metric,
+                        "max_area_imperial": dims.max_area_imperial,
+                        "calculated_sq_area_metric": dims.calculated_sq_area_metric,
+                        "calculated_area_imperial": dims.calculated_area_imperial,
+                    }
+                # Include scaling factors if available
+                if hasattr(room, "scaling_factors") and room.scaling_factors:
+                    sf = room.scaling_factors
+                    room_payload["sdb_scaling_factors"] = {  # Use 'sdb_' prefix
+                        "scale_metric": sf.scale_metric,
+                        "scale_imperial": sf.scale_imperial,
+                    }
+                rooms_list.append(room_payload)
+            csv_floor_payload["sdb_rooms"] = rooms_list  # Use 'sdb_' prefix
+            csv_floors_list.append(csv_floor_payload)
+        all_floors_payload["sdb_csv_floors"] = csv_floors_list  # Use 'sdb_' prefix
 
-            # --- Process Raw Row Data (AllFloorsCsvData) ---
-            raw_rows_list = []
-            # Efficiently serialize using model_to_dict or values()
-            raw_row_queryset = all_floors.all_floors_csv_data.all().order_by(
-                "id"
-            )  # Order for consistency
-            for raw_row in raw_row_queryset:
-                # Exclude the foreign key object itself to avoid circular refs
-                raw_row_dict = model_to_dict(raw_row, exclude=["all_floors_data"])
-                # Could add the parent ID explicitly if needed
-                # raw_row_dict['all_floors_data_id'] = raw_row.all_floors_data_id
-                raw_rows_list.append(raw_row_dict)
-            all_floors_payload["backup_all_floors_csv_data"] = raw_rows_list
-            logger.debug("Serialized %d raw CSV rows.", len(raw_rows_list))
-            # --- END Raw Row Data ---
+        # Process Raw Row Data (AllFloorsCsvData) - Match SDB Serializer field name
+        raw_rows_list = []
+        # Efficiently serialize using values() - select only fields needed by SDB serializer
+        raw_row_queryset = all_floors.all_floors_csv_data.values(
+            "floor_name",
+            "room_name",
+            "is_segment",
+            "dimensions_imperial",
+            "dimensions_metric",
+            "room_id",
+            "no_of_door",
+            "no_of_window",
+            "no_of_room_points",
+            "min_x_pixels",
+            "min_y_pixels",
+            "max_x_pixels",
+            "max_y_pixels",
+            "max_area_metric",
+            "max_area_imperial",
+            "max_area_pixels",
+            "actual_area_pixels",
+            "pixel_ratio",
+            "scale_metric",
+            "scale_imperial",
+            "calculated_sq_area_metric",
+            "calculated_floor_total_sq_area_metric",
+            "calculated_area_imperial",
+            "calculated_floor_total_sq_area_imperial",
+        ).order_by(
+            "id"
+        )  # Order for consistency
 
-            # --- Process Total Area Data (TotalAreasCsvData) --- Optional, include if needed
-            logger.debug("Serializing total area data for backup...")
-            total_area_list = []
-            total_area_queryset = all_floors.total_areas_csv_data.all().order_by(
-                "id"
-            )  # Order for consistency
-            for ta_data in total_area_queryset:
-                # Exclude the foreign key object
-                ta_data_dict = model_to_dict(ta_data, exclude=["all_floors_data"])
-                total_area_list.append(ta_data_dict)
-            all_floors_payload["backup_total_areas_csv_data"] = total_area_list
-            logger.debug("Serialized %d total area data rows.", len(total_area_list))
-            # --- END Total Area Data ---
+        raw_rows_list = list(raw_row_queryset)  # Convert queryset to list of dicts
+        all_floors_payload["all_floors_csv_data"] = raw_rows_list
+        logger.debug("Serialized %d raw CSV rows for SDB.", len(raw_rows_list))
 
-            payload["backup_all_floors_data"] = all_floors_payload
-        else:
-            logger.info(
-                "No AllFloorsData found for FloorPlan ID %s, skipping related backup data.",
-                instance.floorplan_id,
-            )
+        # Process Total Area Data (TotalAreasCsvData) - Match SDB Serializer field name
+        total_area_list = []
+        total_area_queryset = all_floors.total_areas_csv_data.values(
+            "area_name",
+            "square_meters",
+            "square_feet",
+            "total_floors",
+            "total_named_rooms",
+            "total_segments",
+            "total_points",
+            "total_objects",
+            "total_door_objects",
+            "total_window_objects",
+            "total_stair_objects",
+            "list_of_objects",
+            "total_actual_pixels",
+            "metric_scale",
+            "imperial_scale",
+            "input_image_tokens",
+            "input_text_tokens",
+            "output_text_tokens",
+        ).order_by(
+            "id"
+        )  # Order for consistency
 
-        # Process PlanFloor data.
-        logger.debug("Serializing PlanFloor data...")
-        backup_plan_floors = []
-        for pf in instance.plan_floors.all():
-            pf_payload = {
-                "floor": pf.floor,
-                "label_me_url": pf.label_me_url,
-                "json_file_url": pf.json_file_url,
-                "image_url": pf.image_url,
-                "labelme_image_url": pf.labelme_image_url,
-                "csv_url": pf.csv_url,
-                "image_side_by_side_url": pf.image_side_by_side_url,
-            }
-            backup_plan_floors.append(pf_payload)
-        payload["backup_plan_floors"] = backup_plan_floors
-        logger.debug("Serialized %d PlanFloor entries.", len(backup_plan_floors))
+        total_area_list = list(total_area_queryset)  # Convert queryset to list of dicts
+        all_floors_payload["total_areas_csv_data"] = total_area_list
+        logger.debug(
+            "Serialized %d total area data rows for SDB.", len(total_area_list)
+        )
 
-        # Send the payload to the backup endpoint.
-        backup_url = f"{settings.BACKUP_SERVICE_URL}/api/backup/floorplan/"
+        payload["sdb_all_floors_data"] = all_floors_payload  # Use 'sdb_' prefix
+    else:
         logger.info(
-            "Sending backup payload for FloorPlan ID %s to %s",
+            "No AllFloorsData found for FloorPlan ID %s, skipping related sdb data.",
+            instance.floorplan_id,
+        )
+
+    # Process PlanFloor data.
+    logger.debug("Serializing PlanFloor data for SDB...")
+    sdb_plan_floors = []
+    for pf in instance.plan_floors.all():
+        pf_payload = {
+            "floor": pf.floor,
+            "label_me_url": pf.label_me_url,
+            "json_file_url": pf.json_file_url,
+            "image_url": pf.image_url,
+            "labelme_image_url": pf.labelme_image_url,
+            "csv_url": pf.csv_url,
+            "image_side_by_side_url": pf.image_side_by_side_url,
+        }
+        sdb_plan_floors.append(pf_payload)
+    payload["sdb_plan_floors"] = sdb_plan_floors  # Use 'sdb_' prefix
+    logger.debug("Serialized %d PlanFloor entries for SDB.", len(sdb_plan_floors))
+
+    return payload
+
+
+# --- Main Backup Function (calls the serializer and sends) ---
+def backup_floorplan(instance):
+    """Serializes floorplan data for SDB and sends it to the backup service."""
+    backup_url = None  # Define outside try block
+    try:
+        payload = serialize_floorplan_for_sdb(instance)
+        if payload is None:
+            # Serialization failed, error already logged in helper
+            return
+
+        # Send the payload to the SDB endpoint.
+        # Make sure the path matches sdb/urls.py -> /api/sdb/floorplan/
+        base_url = settings.BACKUP_SERVICE_URL.rstrip("/")
+        backup_url = f"{base_url}/api/sdb/floorplan/"  # Adjusted path
+
+        logger.info(
+            "Sending SDB payload for FloorPlan ID %s to %s",
             instance.floorplan_id,
             backup_url,
         )
-        response = requests.post(backup_url, json=payload, timeout=5)
-        # If there is a 400 or any HTTP error, log the response details.
-        response.raise_for_status()
+        response = requests.post(
+            backup_url, json=payload, timeout=30
+        )  # Increased timeout
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+
         logger.info(
-            "Backup successful for FloorPlan ID %s. Response status: %s",
+            "SDB sync successful for FloorPlan ID %s. Response status: %s",
             instance.floorplan_id,
             response.status_code,
         )
     except requests.exceptions.Timeout:
         logger.error(
-            "Timeout occurred while sending backup for FloorPlan ID %s to %s",
+            "Timeout occurred while sending SDB sync for FloorPlan ID %s to %s",
             instance.floorplan_id,
-            backup_url,
+            backup_url or "N/A",
         )
-        # Re-raise or handle as needed - maybe retry?
-        raise Exception(
-            f"Timeout backing up floorplan {instance.floorplan_id}"
-        ) from None
+        # Consider if retry is needed here within the Celery task context
+        # raise Exception(f"Timeout syncing floorplan {instance.floorplan_id} to SDB") from None
     except requests.HTTPError as http_err:
-        # Log response content to help pinpoint validation errors on the backup service
         error_details = "No response body"
         try:
-            error_details = (
-                http_err.response.text
-            )  # Use .text for JSON or other text formats
+            error_details = http_err.response.text
         except Exception:
-            logger.warning("Could not decode error response body for backup failure.")
-
+            logger.warning("Could not decode error response body for SDB sync failure.")
         logger.error(
-            "HTTP Error backing up FloorPlan ID %s: %s - Status Code: %s - Details: %s",
+            "HTTP Error syncing SDB for FloorPlan ID %s: %s - Status Code: %s - Details: %s",
             instance.floorplan_id,
             str(http_err),
-            http_err.response.status_code,
+            http_err.response.status_code if http_err.response else "N/A",
             error_details,
         )
-        raise Exception(
-            f"HTTP error backing up floorplan {instance.floorplan_id}: {str(http_err)}"
-        ) from http_err
+        # raise Exception(f"HTTP error syncing floorplan {instance.floorplan_id} to SDB: {str(http_err)}") from http_err
     except requests.RequestException as req_err:
         logger.error(
-            "Request Exception during backup for FloorPlan ID %s: %s",
+            "Request Exception during SDB sync for FloorPlan ID %s: %s",
             instance.floorplan_id,
             str(req_err),
         )
-        raise Exception(
-            f"Request error backing up floorplan {instance.floorplan_id}: {str(req_err)}"
-        ) from req_err
+        # raise Exception(f"Request error syncing floorplan {instance.floorplan_id} to SDB: {str(req_err)}") from req_err
     except Exception as e:
-        # Catch any other unexpected errors during serialization or processing
         logger.exception(
-            "Unexpected error during backup process for FloorPlan ID %s: %s",
+            "Unexpected error during SDB sync process for FloorPlan ID %s: %s",
             instance.floorplan_id,
             str(e),
         )
-        raise Exception(
-            f"Failed to complete backup for floorplan {instance.floorplan_id}"
-        ) from e
+        # raise Exception(f"Failed to complete SDB sync for floorplan {instance.floorplan_id}") from e
 
 
 # floorplan/logs/processing_log.csv
@@ -3903,923 +5169,5 @@ Property ID,User ID,Property URL,Floorplan URLs,Status,Timestamp
 58,10,https://www.rightmove.co.uk/properties/158508347,https://media.rightmove.co.uk/55k/54899/158508347/54899_ef2e3c45-d5d0-4ca3-b7fe-718d5542617c_FLP_00_0000.jpeg,Triggered,2025-04-07 11:18:31
 59,8,https://www.rightmove.co.uk/properties/158701067,https://media.rightmove.co.uk/87k/86777/158701067/86777_KNA220532_FLP_00_0000.jpeg,Triggered,2025-04-07 11:19:01
 61,8,https://www.rightmove.co.uk/properties/153638363,https://media.rightmove.co.uk/108k/107488/153638363/107488_Eaton_FLP_00_0000.jpeg,Triggered,2025-04-07 11:19:31
-
-
-# floorplan_service/tasks.py
-from celery import shared_task
-
-
-@shared_task
-def my_task(param):
-    # Do something
-    print(param)
-
-
-# floorplan_service/asgi.py
-import os
-
-from decouple import config
-from django.core.asgi import get_asgi_application
-
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", config("DJANGO_SETTINGS_MODULE"))
-
-application = get_asgi_application()
-
-
-# floorplan_service/__init__.py
-from floorplan_service.celery import app as celery_app
-
-__all__ = ("celery_app",)
-
-
-# floorplan_service/celery.py
-import os
-
-from celery import Celery
-from decouple import config
-from django.conf import settings
-
-# set the default Django settings module for the 'celery' program.
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", config("DJANGO_SETTINGS_MODULE"))
-
-app = Celery("floorplan_service")
-
-# Using a string here means the worker doesn't have to serialize
-# the configuration object to child processes.
-app.config_from_object("django.conf:settings", namespace="CELERY")
-
-# # Set default queue
-# app.conf.task_default_queue = "floorplan_queue"
-
-# # Load task modules from all registered Django app configs.
-app.autodiscover_tasks(lambda: settings.INSTALLED_APPS)
-
-# app.autodiscover_tasks()
-app.conf.broker_url = settings.CELERY_BROKER_URL
-
-
-@app.task(bind=True)
-def debug_task(self):
-    print(f"Request: {self.request!r}")
-
-
-# floorplan_service/urls.py
-from accounts import views as account_views
-from django.conf import settings
-from django.conf.urls.static import static
-from django.contrib import admin
-from django.contrib.staticfiles.urls import staticfiles_urlpatterns
-from django.urls import include, path
-from drf_spectacular.views import (
-    SpectacularAPIView,
-    SpectacularRedocView,
-    SpectacularSwaggerView,
-)
-from drf_yasg import openapi
-from drf_yasg.views import get_schema_view
-from rest_framework import permissions
-from rest_framework.routers import DefaultRouter
-
-router = DefaultRouter()
-
-schema_view = get_schema_view(
-    openapi.Info(
-        title="Analysis Floorplan Service API",
-        default_version="v1",
-        description="This is the documentation for Analysis Floorplan Service API",
-        terms_of_service="https://www.google.com/policies/terms/",
-        contact=openapi.Contact(email="contact@snippets.local"),
-        license=openapi.License(name="BSD License"),
-    ),
-    public=True,
-    permission_classes=[permissions.AllowAny],
-    authentication_classes=[],
-)
-
-default_urlpatterns = [
-    path("admin/", admin.site.urls),
-    path("dj-rest-auth/", include("dj_rest_auth.urls")),
-    path("dj-rest-auth/registration/", include("dj_rest_auth.registration.urls")),
-]
-
-permissions_urlpatterns = [
-    path("api/csrf-cookie/", account_views.GetCSRFToken.as_view()),
-]
-
-custom_urlpatterns = [
-    path("api/auth/", include("accounts.urls")),
-    path("api/floorplan/", include("floorplan.urls")),
-]
-
-spectacular_urlpatterns = [
-    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
-    # Optional UI:
-    path(
-        "api/schema/swagger-ui/",
-        SpectacularSwaggerView.as_view(url_name="schema"),
-        name="swagger-ui",
-    ),
-    path(
-        "api/schema/redoc/",
-        SpectacularRedocView.as_view(url_name="schema"),
-        name="redoc",
-    ),
-] + router.urls
-
-swagger_urlpatterns = [
-    path("swagger.json", schema_view.without_ui(cache_timeout=0), name="schema-json"),
-    path(
-        "swagger/",
-        schema_view.with_ui("swagger", cache_timeout=0),
-        name="schema-swagger-ui",
-    ),
-    path("redoc/", schema_view.with_ui("redoc", cache_timeout=0), name="schema-redoc"),
-]
-
-urlpatterns = (
-    default_urlpatterns
-    + custom_urlpatterns
-    + spectacular_urlpatterns
-    + swagger_urlpatterns
-    + permissions_urlpatterns
-)
-
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
-urlpatterns += staticfiles_urlpatterns()
-
-
-# floorplan_service/wsgi.py
-import os
-
-from decouple import config
-from django.core.wsgi import get_wsgi_application
-
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", config("DJANGO_SETTINGS_MODULE"))
-
-application = get_wsgi_application()
-
-
-# floorplan_service/settings/__init__.py
-
-
-# floorplan_service/settings/dev.py
-from .base import *
-
-DEBUG = True
-ALLOWED_HOSTS = ["*"]
-
-
-# ================================ SUPERUSER =======================================
-ADMIN_USERNAME = config("ADMIN_USERNAME")
-ADMIN_EMAIL = config("ADMIN_EMAIL")
-ADMIN_PASSWORD = config("ADMIN_PASSWORD")
-# ================================ SUPERUSER =======================================
-
-
-# ================================ DATABASES =======================================
-# Get the URL from environment variable or default to SQLite
-# Ensure a sensible default for local dev if DATABASE_URL isn't set
-default_db_url = config("DATABASE_URL", default=None)
-if not default_db_url:
-    # Construct a default SQLite path relative to BASE_DIR if not set
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    default_db_url = f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}"
-    print(f"WARNING: DATABASE_URL not set, using default SQLite: {default_db_url}")
-
-DATABASES = {"default": dj_database_url.parse(default_db_url)}
-
-# DATABASES = {
-#     "default": {
-#         "ENGINE": "django.db.backends.sqlite3",
-#         "NAME": BASE_DIR / "db.sqlite3",
-#     }
-# }
-
-
-# --- Temporary Restore Database (PostgreSQL) ---
-TEMP_RESTORE_DB_NAME = config(
-    "TEMP_RESTORE_DB_NAME", default="floorplandb_temp_restore"
-)
-TEMP_RESTORE_DB_USER = config(
-    "TEMP_RESTORE_DB_USER", default="danai"
-)  # User with access
-TEMP_RESTORE_DB_PASSWORD = config("TEMP_RESTORE_DB_PASSWORD", default="")
-TEMP_RESTORE_DB_HOST = config("TEMP_RESTORE_DB_HOST", default="localhost")
-TEMP_RESTORE_DB_PORT = config("TEMP_RESTORE_DB_PORT", default="5432")
-
-# Only add the temp DB config if essential details are provided
-if TEMP_RESTORE_DB_NAME and TEMP_RESTORE_DB_USER:  # Add PASSWORD check if required
-    DATABASES["temp_restore"] = {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": TEMP_RESTORE_DB_NAME,
-        "USER": TEMP_RESTORE_DB_USER,
-        "PASSWORD": TEMP_RESTORE_DB_PASSWORD,
-        "HOST": TEMP_RESTORE_DB_HOST,
-        "PORT": TEMP_RESTORE_DB_PORT,
-        "TEST": {
-            # Prevent Django from trying to manage this DB during tests
-            # Often mirroring 'default' or setting 'SERIALIZE': False is needed
-            "MIRROR": "default",
-        },
-        # Optional: Add connection options if needed
-        # 'OPTIONS': {
-        #     'connect_timeout': 5,
-        # }
-    }
-    print(f"INFO: Temporary restore database '{TEMP_RESTORE_DB_NAME}' configured.")
-else:
-    print(
-        "WARNING: Temporary restore database configuration skipped (missing NAME or USER)."
-    )
-# ================================ DATABASES =======================================
-
-
-# ================================ STORAGES =======================================
-# ==> STATIC FILE UPLOADS
-STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, "static"),
-]
-
-# ==> MEDIA FILE UPLOADS
-MEDIA_URL = "media/"
-MEDIA_ROOT = BASE_DIR / "media"
-# ================================ STORAGES =======================================
-
-
-# ================================ REDIS/CHANNELS =======================================
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": config("REDIS_URL"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
-
-# ==> CHANNELS
-default_channel_layer = {
-    "BACKEND": "channels_redis.core.RedisChannelLayer",
-    "CONFIG": {
-        "hosts": [config("REDIS_URL")],  # , 'redis://127.0.0.1:6379')],
-    },
-}
-CHANNEL_LAYERS = {"default": default_channel_layer}
-# ================================ REDIS =======================================
-
-
-# ================================ CELERY =======================================
-# Use the actual IP address and port of your Redis server
-CELERY_BROKER_URL = config("REDIS_URL")
-CELERY_RESULT_BACKEND = config("REDIS_URL")
-CELERY_TIMEZONE = "UTC"
-
-# List of modules to import when the Celery worker starts.
-CELERY_IMPORTS = ("floorplan_service.tasks",)
-
-# If using JSON as the serialization format
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-# ================================ CELERY =======================================
-
-
-# ================================ REDIS =======================================
-REDIS_HOST = "redis"
-REDIS_PORT = 6379
-# Choose a database number for this specific temporary storage
-# Avoid using DB 0 if your main cache or Celery broker uses it
-REDIS_DB_TEMP_FLOORPLANS = 1
-# Time-to-live for the stored original floorplan data (e.g., 1 day = 86400 seconds)
-# Adjust based on how long your analysis task might reasonably take + buffer
-REDIS_TEMP_FLOORPLANS_TTL = 86400
-# ================================ REDIS =======================================
-
-
-# floorplan_service/settings/prod.py
-# import django_on_heroku
-
-from .base import *
-
-DEBUG = False
-ALLOWED_HOSTS = ["*"]
-
-
-# ================================ DATABASES =======================================
-DATABASES = {"default": dj_database_url.parse(config("DATABASE_URL"))}
-# DATABASES["default"]["OPTIONS"] = {"sslmode": "require"}
-# ================================ DATABASES =======================================
-
-
-# ================================ STORAGES =======================================
-# ==> AMAZON S3 SETTINGS
-AWS_ACCESS_KEY_ID = config("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = config("AWS_SECRET_ACCESS_KEY")
-AWS_STORAGE_BUCKET_NAME = config("AWS_STORAGE_BUCKET_NAME")
-AWS_S3_FILE_OVERWRITE = False
-AWS_DEFAULT_ACL = None
-AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
-AWS_S3_OBJECT_PARAMETERS = {"CacheControl": "max-age-86400"}
-AWS_LOCATION = "static"
-AWS_QUERYSTRING_AUTH = False
-AWS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-}
-
-# ==> MEDIA FILE UPLOADS
-PUBLIC_MEDIA_LOCATION = "media"
-MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{PUBLIC_MEDIA_LOCATION}/"
-# DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
-DEFAULT_FILE_STORAGE = f"{config('PROJECT_NAME')}.config.storage_backends.MediaStorage"
-
-# ==> STATIC FILE UPLOADS
-STATICFILES_STORAGE = "storages.backends.s3boto3.S3StaticStorage"
-STATIC_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{AWS_LOCATION}/"
-# ================================ STORAGES =======================================
-
-
-# ================================ REDIS/CHANNELS =======================================
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": config("REDIS_URL"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
-
-# ==> CHANNELS
-default_channel_layer = {
-    "BACKEND": "channels_redis.core.RedisChannelLayer",
-    "CONFIG": {
-        "hosts": [config("REDIS_URL")],  # , 'redis://127.0.0.1:6379')],
-    },
-}
-CHANNEL_LAYERS = {"default": default_channel_layer}
-# ================================ REDIS =======================================
-
-
-# ================================ CELERY =======================================
-# Use the actual IP address and port of your Redis server
-CELERY_BROKER_URL = config("REDIS_URL")
-CELERY_RESULT_BACKEND = config("REDIS_URL")
-CELERY_TIMEZONE = "UTC"
-
-# List of modules to import when the Celery worker starts.
-CELERY_IMPORTS = (f"{config('PROJECT_NAME')}.tasks",)
-
-# If using JSON as the serialization format
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-
-# CELERY_TASK_QUEUES = {
-#     "analysis_queue": {
-#         "exchange": "analysis_exchange",
-#         "routing_key": "analysis.#",
-#     },
-# }
-# ================================ CELERY =======================================
-
-# MY_DOMAIN = "http://analysis-app:8000"
-
-# ================================ HEROKU =======================================
-# # ==> HEROKU LOGGING
-# DEBUG_PROPAGATE_EXCEPTIONS = True
-# LOGGING = {
-#     "version": 1,
-#     "disable_existing_loggers": False,
-#     "formatters": {
-#         "verbose": {
-#             "format": "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s",
-#             "datefmt": "%d/%b/%Y %H:%M:%S",
-#         },
-#         "simple": {
-#             "format": "[%(asctime)s] %(levelname)s %(message)s",
-#         },
-#     },
-#     "handlers": {
-#         "console": {
-#             "level": "DEBUG",
-#             "class": "logging.StreamHandler"
-#         }
-#     },
-#     "loggers": {
-#         "dfxapp": {
-#             "handlers": ["console"],
-#             "level": "INFO",
-#         },
-#     },
-# }
-
-# # ==> HEROKU DATABASE
-# django_on_heroku.settings(locals(), staticfiles=False)
-# del DATABASES["default"]["OPTIONS"]["sslmode"]
-# ================================ HEROKU =======================================
-
-
-# ================================ SSL CONFIG =======================================
-# # Force SSL redirect if site is live
-# if os.getcwd() == '/app':ls
-
-#     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-#     SECURE_SSL_REDIRECT = True
-#     # DEBUG = False
-
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-USE_X_FORWARDED_HOST = True
-# ================================ SSL CONFIG =======================================
-
-
-# floorplan_service/settings/staging.py
-# import django_on_heroku
-
-from .base import *
-
-DEBUG = False
-ALLOWED_HOSTS = ["*"]
-
-
-# ================================ DATABASES =======================================
-DATABASES = {"default": dj_database_url.parse(config("DATABASE_URL"))}
-# DATABASES["default"]["OPTIONS"] = {"sslmode": "require"}
-# ================================ DATABASES =======================================
-
-
-# ================================ STORAGES =======================================
-# ==> AMAZON S3 SETTINGS
-AWS_ACCESS_KEY_ID = config("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = config("AWS_SECRET_ACCESS_KEY")
-AWS_STORAGE_BUCKET_NAME = config("AWS_STORAGE_BUCKET_NAME")
-AWS_S3_FILE_OVERWRITE = False
-AWS_DEFAULT_ACL = None
-AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
-AWS_S3_OBJECT_PARAMETERS = {"CacheControl": "max-age-86400"}
-AWS_LOCATION = "static"
-AWS_QUERYSTRING_AUTH = False
-AWS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-}
-
-# ==> MEDIA FILE UPLOADS
-PUBLIC_MEDIA_LOCATION = "media"
-MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{PUBLIC_MEDIA_LOCATION}/"
-# DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
-DEFAULT_FILE_STORAGE = "floorplan_service.config.storage_backends.MediaStorage"
-
-# ==> STATIC FILE UPLOADS
-STATICFILES_STORAGE = "storages.backends.s3boto3.S3StaticStorage"
-STATIC_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{AWS_LOCATION}/"
-# ================================ STORAGES =======================================
-
-# ================================ REDIS/CHANNELS =======================================
-# CACHES = {
-#     "default": {
-#         "BACKEND": "django_redis.cache.RedisCache",
-#         "LOCATION": config("REDIS_URL"),
-#         "OPTIONS": {
-#             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-#         }
-#     }
-# }
-
-# ==> CHANNELS
-default_channel_layer = {
-    "BACKEND": "channels_redis.core.RedisChannelLayer",
-    "CONFIG": {
-        "hosts": [config("REDIS_URL")],  # , 'redis://127.0.0.1:6379')],
-    },
-}
-CHANNEL_LAYERS = {"default": default_channel_layer}
-# ================================ REDIS =======================================
-
-
-# ================================ CELERY =======================================
-# Use the actual IP address and port of your Redis server
-CELERY_BROKER_URL = config("REDIS_URL")
-CELERY_RESULT_BACKEND = config("REDIS_URL")
-CELERY_TIMEZONE = "UTC"
-
-# List of modules to import when the Celery worker starts.
-CELERY_IMPORTS = ("floorplan_service.tasks",)
-
-# If using JSON as the serialization format
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-
-CELERY_TASK_QUEUES = {
-    "analysis_queue": {
-        "exchange": "analysis_exchange",
-        "routing_key": "analysis.#",
-    },
-}
-# ================================ CELERY =======================================
-
-MY_DOMAIN = "http://notification-service:8000"
-
-# ================================ HEROKU =======================================
-# # ==> HEROKU LOGGING
-# DEBUG_PROPAGATE_EXCEPTIONS = True
-# LOGGING = {
-#     "version": 1,
-#     "disable_existing_loggers": False,
-#     "formatters": {
-#         "verbose": {
-#             "format": "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s",
-#             "datefmt": "%d/%b/%Y %H:%M:%S",
-#         },
-#         "simple": {
-#             "format": "[%(asctime)s] %(levelname)s %(message)s",
-#         },
-#     },
-#     "handlers": {
-#         "console": {
-#             "level": "DEBUG",
-#             "class": "logging.StreamHandler"
-#         }
-#     },
-#     "loggers": {
-#         "dfxapp": {
-#             "handlers": ["console"],
-#             "level": "INFO",
-#         },
-#     },
-# }
-
-# # ==> HEROKU DATABASE
-# django_on_heroku.settings(locals(), staticfiles=False)
-# del DATABASES["default"]["OPTIONS"]["sslmode"]
-# ================================ HEROKU =======================================
-
-
-# ================================ SSL CONFIG =======================================
-# # Force SSL redirect if site is live
-# if os.getcwd() == '/app':ls
-
-#     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-#     SECURE_SSL_REDIRECT = True
-#     # DEBUG = False
-# ================================ SSL CONFIG =======================================
-
-
-# floorplan_service/settings/base.py
-import os
-import secrets
-from datetime import timedelta
-from pathlib import Path
-from typing import List
-
-import dj_database_url
-from corsheaders.defaults import default_headers
-from decouple import config
-
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-SECRET_KEY = config("SECRET_KEY")
-
-# Application definition
-DEFAULT_APPS = [
-    "django.contrib.admin",
-    "django.contrib.auth",
-    "django.contrib.contenttypes",
-    "django.contrib.sessions",
-    "django.contrib.messages",
-    "django.contrib.staticfiles",
-]
-
-THIRD_PARTY_APPS = [
-    "corsheaders",
-    "channels",
-    "django_countries",
-    "django_extensions",
-    "django_filters",
-    "django_rest_passwordreset",
-    "drf_yasg",
-    "drf_spectacular",
-    "simple_history",
-    "storages",
-    "django.contrib.sites",
-    "rest_framework",
-    "rest_framework.authtoken",
-    "rest_framework_simplejwt",
-    "rest_framework_simplejwt.token_blacklist",
-    "allauth",
-    "allauth.account",
-    "allauth.socialaccount",
-    "allauth.socialaccount.providers.google",
-    # 'allauth.socialaccount.providers.facebook',
-    "dj_rest_auth",
-    "dj_rest_auth.registration",
-]
-
-LOCAL_APPS = ["accounts", "floorplan"]
-
-OTHER_APPS = [
-    # "debug_toolbar",
-]
-
-INSTALLED_APPS = DEFAULT_APPS + LOCAL_APPS + THIRD_PARTY_APPS + OTHER_APPS
-
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "corsheaders.middleware.CorsMiddleware",  # Custom added
-    "simple_history.middleware.HistoryRequestMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "allauth.account.middleware.AccountMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    # 'accounts.middleware.PaymentMiddleware',
-]
-
-ROOT_URLCONF = "floorplan_service.urls"
-
-TEMPLATES = [
-    {
-        "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [os.path.join(BASE_DIR, "templates")],
-        "APP_DIRS": True,
-        "OPTIONS": {
-            "context_processors": [
-                "django.template.context_processors.debug",
-                "django.template.context_processors.request",
-                "django.contrib.auth.context_processors.auth",
-                "django.contrib.messages.context_processors.messages",
-            ],
-        },
-    },
-]
-
-WSGI_APPLICATION = "floorplan_service.wsgi.application"
-
-
-# Password validation
-# https://docs.djangoproject.com/en/4.2/ref/settings/#auth-password-validators
-
-AUTH_PASSWORD_VALIDATORS = [
-    {
-        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
-    },
-    {
-        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
-    },
-    {
-        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
-    },
-    {
-        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
-    },
-]
-
-
-# Internationalization
-# https://docs.djangoproject.com/en/4.2/topics/i18n/
-
-LANGUAGE_CODE = "en-us"
-
-TIME_ZONE = "UTC"
-
-USE_I18N = True
-
-USE_TZ = True
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
-
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-
-# ================================ CUSTOM CONFIGS =======================================
-AUTH_USER_MODEL = "accounts.User"
-ASGI_APPLICATION = "floorplan_service.asgi.application"
-
-LOGIN_URL = "login"
-LOGOUT_URL = "logout"
-LOGIN_REDIRECT_URL = "index"  # "dashboard"
-LOGOUT_REDIRECT_URL = "login"
-
-
-def get_origin_list(env_variable: str, default: str = "") -> List[str]:
-    origins: str = config(env_variable, default)
-    return [origin.strip() for origin in origins.split(",") if origin.strip()]
-
-
-# ==> CORS
-CORS_ALLOW_ALL_ORIGINS = False
-CORS_ALLOWED_ORIGINS = get_origin_list("CORS_ORIGINS")
-CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_HEADERS = list(default_headers) + [
-    "x-csrftoken",
-]
-
-# ==> CSRF
-CSRF_TRUSTED_ORIGINS = get_origin_list("CSRF_TRUSTED_ORIGINS")
-CSRF_COOKIE_SAMESITE = "Lax"
-SESSION_COOKIE_SAMESITE = "Lax"
-CSRF_COOKIE_HTTPONLY = False  # False to allow JavaScript to access the cookie
-SESSION_COOKIE_HTTPONLY = True
-
-# ==> CONSTANTS
-CART_SESSION_ID = secrets.token_urlsafe(16)
-
-SITE_ID = 1
-
-# ==> AUTHENTICATION
-AUTHENTICATION_BACKENDS = [
-    "django.contrib.auth.backends.ModelBackend",
-    # "allauth.account.auth_backends.AuthenticationBackend",
-]
-
-# ==> DJ-REST-Auth settings
-REST_AUTH = {
-    "USE_JWT": True,
-    "JWT_AUTH_COOKIE": "my-app-auth",
-    "JWT_AUTH_REFRESH_COOKIE": "my-refresh-token",
-}
-
-# ==> REST FRAMEWORK
-REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.TokenAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
-    ],
-    # "DEFAULT_PERMISSION_CLASSES": [
-    #     "rest_framework.permissions.IsAuthenticated",
-    # ],
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
-    "PAGE_SIZE": 10,
-}
-
-SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=10),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
-    "ROTATE_REFRESH_TOKENS": False,
-    "BLACKLIST_AFTER_ROTATION": False,
-    "UPDATE_LAST_LOGIN": False,
-    "ALGORITHM": "HS256",
-    "SIGNING_KEY": SECRET_KEY,
-    "VERIFYING_KEY": "",
-    "AUDIENCE": None,
-    "ISSUER": None,
-    "JSON_ENCODER": None,
-    "JWK_URL": None,
-    "LEEWAY": 0,
-    "AUTH_HEADER_TYPES": ("Bearer",),
-    "AUTH_HEADER_NAME": "HTTP_AUTHORIZATION",
-    "USER_ID_FIELD": "id",
-    "USER_ID_CLAIM": "user_id",
-    "USER_AUTHENTICATION_RULE": "rest_framework_simplejwt.authentication.default_user_authentication_rule",
-    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
-    "TOKEN_TYPE_CLAIM": "token_type",
-    "TOKEN_USER_CLASS": "rest_framework_simplejwt.models.TokenUser",
-    "JTI_CLAIM": "jti",
-    "SLIDING_TOKEN_REFRESH_EXP_CLAIM": "refresh_exp",
-    "SLIDING_TOKEN_LIFETIME": timedelta(minutes=15),
-    "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=1),
-    "TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainPairSerializer",
-    "TOKEN_REFRESH_SERIALIZER": "rest_framework_simplejwt.serializers.TokenRefreshSerializer",
-    "TOKEN_VERIFY_SERIALIZER": "rest_framework_simplejwt.serializers.TokenVerifySerializer",
-    "TOKEN_BLACKLIST_SERIALIZER": "rest_framework_simplejwt.serializers.TokenBlacklistSerializer",
-    "SLIDING_TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainSlidingSerializer",
-    "SLIDING_TOKEN_REFRESH_SERIALIZER": "rest_framework_simplejwt.serializers.TokenRefreshSlidingSerializer",
-}
-
-SPECTACULAR_SETTINGS = {
-    "TITLE": "Notification Service API",
-    "DESCRIPTION": "Notification Service description",
-    "VERSION": "1.0.0",
-    "SERVE_INCLUDE_SCHEMA": True,
-}
-
-# ================================ CUSTOM VARIABLES =======================================
-# ==> SUPERUSER
-ADMIN_USERNAME = config("ADMIN_USERNAME")
-ADMIN_EMAIL = config("ADMIN_EMAIL")
-ADMIN_PHONE = config("ADMIN_PHONE")
-ADMIN_PASSWORD = config("ADMIN_PASSWORD")
-
-# ==> OPENAI
-OPENAI_API_KEY = config("OPENAI_API_KEY")
-ASSISTANT_ID = config("ASSISTANT_ID")
-MODEL_NAME = config("MODEL_NAME")
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-# ==> EXTERNAL SERVICES
-# SCRAPER APP
-SCRAPER_SERVICE_URL = config("SCRAPER_SERVICE_URL")
-
-# ORCHESTRATOR APP
-ORCHESTRATOR_APP_URL = config("ORCHESTRATOR_APP_URL")
-
-# BACKUP_DB_SERVICE
-BACKUP_SERVICE_URL = config("BACKUP_SERVICE_URL")
-
-FLOORPLAN_WEBHOOK_URL = config("FLOORPLAN_WEBHOOK_URL")
-FLOORPLAN_ANALYZER_URL = config("FLOORPLAN_ANALYZER_URL")
-# ================================ CUSTOM VARIABLES =======================================
-
-
-# floorplan_service/config/logging_config.py
-import logging
-import os
-
-# from celery.signals import after_setup_logger
-
-
-# @after_setup_logger.connect
-# def setup_loggers(logger, *args, **kwargs):
-#     logger.addHandler(logging.StreamHandler())
-#     logger.setLevel(logging.DEBUG)
-
-
-class CustomFormatter(logging.Formatter):
-    def __init__(self, fmt="%(levelname)s: %(message)s"):
-        super().__init__(fmt)
-
-    def format(self, record):
-        # Change format for ERROR level and above (ERROR, CRITICAL)
-        if record.levelno >= logging.ERROR:
-            self._style._fmt = "%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
-        else:
-            self._style._fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        return super().format(record)
-
-
-def configure_logger(name):
-    # Create or get a logger
-    logger = logging.getLogger(name)
-
-    # Set the log level
-    logger.setLevel(logging.DEBUG)  # Set to DEBUG to catch all levels
-
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(CustomFormatter())
-
-    # Create file handler for connection logs
-    file_handler = logging.FileHandler("connections.log")
-    file_handler.setFormatter(CustomFormatter())
-
-    # Add handlers to the logger
-    if not logger.handlers:  # Avoid adding multiple handlers if already present
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-
-    return logger
-
-
-def configure_file_logger(name):
-    # Create or get a logger
-    logger = logging.getLogger(name)
-
-    # Set the log level
-    logger.setLevel(logging.DEBUG)  # Set to DEBUG to catch all levels
-
-    # Create file handler for connection logs
-    log_file_path = "floorplan_service/connections.log"
-    file_handler = logging.FileHandler(log_file_path)
-    file_handler.setFormatter(CustomFormatter())
-
-    # Add handler to the logger
-    if not any(
-        isinstance(handler, logging.FileHandler) for handler in logger.handlers
-    ):  # Avoid adding multiple file handlers
-        logger.addHandler(file_handler)
-
-    return logger
-
-
-# floorplan_service/config/base_config.py
-from django.conf import settings
-from openai import OpenAI
-
-openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
-
-
-# floorplan_service/config/__init__.py
-
-
-# floorplan_service/config/storage_backends.py
-from storages.backends.s3boto3 import S3Boto3Storage
-
-# class StaticStorage(S3Boto3Storage):
-#     location = "static"
-#     default_acl = "private"
-
-
-class MediaStorage(S3Boto3Storage):
-    location = "media"
-    default_acl = "private"
-    file_overwrite = False
 
 

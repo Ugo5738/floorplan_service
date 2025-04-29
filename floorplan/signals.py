@@ -127,7 +127,7 @@
     {
         "floorplan_id": "fp1",
         "original_url": "https://media.rightmove.co.uk/85k/84073/157593251/84073_1312423_FLP_00_0001.png",
-        "all_floors": {
+        "all_floors": {  #
             "json_file_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/all_floors_json.json",
             "csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/all_floors.csv",
             "total_area_csv_url": "https://floorsbucket.s3.eu-north-1.amazonaws.com/processed_images_folder/user_sami1234_property_samiprop1234/floorid_fp1/total_area.csv",

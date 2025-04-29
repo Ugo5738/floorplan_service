@@ -1,9 +1,17 @@
 # floorplan/management/commands/check_sdb_consistency.py
+import time
+
 import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connections
 from django.db.utils import OperationalError
+
+# We need a way to represent the SDB FloorPlan model.
+# Easiest way IF sdb is installed as an app (unlikely): from sdb.models import FloorPlan as FloorPlanBackup
+# Alternative: Raw SQL or define a stub model if needed.
+# Let's try querying via alias directly.
+from requests.exceptions import RequestException
 
 # Import models from BOTH apps (assuming sdb models are accessible somehow,
 # or we query raw SQL, or we define simplified stub models here).
@@ -11,12 +19,6 @@ from django.db.utils import OperationalError
 from floorplan.models import FloorPlan as FloorPlanSource
 from floorplan.utils.backup import serialize_floorplan_for_sdb  # For re-sync
 from floorplan_service.config.logging_config import configure_logger
-
-# We need a way to represent the SDB FloorPlan model.
-# Easiest way IF sdb is installed as an app (unlikely): from sdb.models import FloorPlan as FloorPlanBackup
-# Alternative: Raw SQL or define a stub model if needed.
-# Let's try querying via alias directly.
-
 
 logger = configure_logger(__name__)
 
