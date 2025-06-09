@@ -13,19 +13,19 @@ from floorplan.models import (
 class TotalAreasCsvDataSerializer(serializers.ModelSerializer):
     class Meta:
         model = TotalAreasCsvData
-        exclude = ["history", "created_at", "updated_at", "all_floors_data"]
+        exclude = ["created_at", "updated_at", "all_floors_data"]
 
 
 class AllFloorsCsvDataSerializer(serializers.ModelSerializer):
     class Meta:
         model = AllFloorsCsvData
-        exclude = ["history", "created_at", "updated_at", "all_floors_data"]
+        exclude = ["created_at", "updated_at", "all_floors_data"]
 
 
 class PlanFloorSerializer(serializers.ModelSerializer):
     class Meta:
         model = PlanFloor
-        exclude = ["history", "created_at", "updated_at", "floor_plan"]
+        exclude = ["created_at", "updated_at", "floor_plan"]
 
 
 class AllFloorsDataSerializer(serializers.ModelSerializer):
@@ -34,7 +34,7 @@ class AllFloorsDataSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = AllFloorsData
-        exclude = ["history", "created_at", "updated_at", "floor_plan"]
+        exclude = ["created_at", "updated_at", "floor_plan"]
 
 
 class FloorPlanSerializer(serializers.ModelSerializer):
@@ -43,7 +43,7 @@ class FloorPlanSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = FloorPlan
-        exclude = ["history", "created_at", "updated_at", "analysis_result"]
+        exclude = ["created_at", "updated_at", "analysis_result"]
 
 
 class FloorPlanAnalysisResultSerializer(serializers.ModelSerializer):
@@ -51,7 +51,7 @@ class FloorPlanAnalysisResultSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = FloorPlanAnalysisResult
-        exclude = ["history", "created_at", "updated_at"]
+        exclude = ["created_at", "updated_at"]
 
 
 class PropertyOverviewSerializer(serializers.ModelSerializer):
