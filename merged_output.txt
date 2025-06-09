@@ -730,7 +730,7 @@ def _download_csv_content(csv_url, context_msg):
         return response.text
     except requests.Timeout:
         logger.error("Timeout downloading CSV for %s from %s", context_msg, csv_url)
-        return None
+        raise ConnectionError(f"Timeout downloading CSV for {context_msg}")
     except requests.RequestException as e:
         status_code = getattr(e.response, "status_code", "N/A")
         logger.error(
@@ -740,7 +740,9 @@ def _download_csv_content(csv_url, context_msg):
             str(e),
             status_code,
         )
-        return None
+        raise ConnectionError(
+            f"Failed download CSV for {context_msg}: Status {status_code}"
+        )
 
 
 def _process_main_csv(all_floors_data):
@@ -1131,6 +1133,12 @@ def process_raw_csv_rows(rows, all_floors_data, fieldnames):
 
 def _process_total_area_csv(all_floors_data):
     """Downloads and processes the total_area.csv."""
+    if not all_floors_data or not all_floors_data.pk:
+        logger.error("Invalid AllFloorsData instance passed to _process_total_area_csv")
+        raise ValueError(
+            "Invalid AllFloorsData instance"
+        )  # Raise error to signal failure
+
     total_area_csv_url = all_floors_data.total_area_csv_url
     context_msg = f"total_area.csv for AllFloorsData ID {all_floors_data.id} (FloorPlan: {all_floors_data.floor_plan.floorplan_id})"
     csv_content = _download_csv_content(total_area_csv_url, context_msg)
@@ -1179,9 +1187,7 @@ def _process_total_area_csv(all_floors_data):
                     "total_window_objects": safe_int(row.get("Total Window Objects")),
                     "total_stair_objects": safe_int(row.get("Total Stair Objects")),
                     "list_of_objects": safe_string(row.get("List of Objects")),
-                    "total_actual_pixels": safe_float(
-                        row.get("Total Actual Pixels")
-                    ),  # Check header name
+                    "total_actual_pixels": safe_float(row.get("Total Pixels")),
                     "metric_scale": safe_float(row.get("Metric Scale")),
                     "imperial_scale": safe_float(row.get("Imperial Scale")),
                     "input_image_tokens": safe_int(row.get("Input Image Tokens")),
@@ -2740,9 +2746,7 @@ class Command(BaseCommand):
             "scale_metric",
             "scale_imperial",
             "calculated_sq_area_metric",
-            "calculated_floor_total_sq_area_metric",
             "calculated_area_imperial",
-            "calculated_floor_total_sq_area_imperial",
             "created_at",  # Changed header name
         ]
 
@@ -2787,13 +2791,7 @@ class Command(BaseCommand):
                         self._get_safe_value(row, "scale_metric"),
                         self._get_safe_value(row, "scale_imperial"),
                         self._get_safe_value(row, "calculated_sq_area_metric"),
-                        self._get_safe_value(
-                            row, "calculated_floor_total_sq_area_metric"
-                        ),
                         self._get_safe_value(row, "calculated_area_imperial"),
-                        self._get_safe_value(
-                            row, "calculated_floor_total_sq_area_imperial"
-                        ),
                         self._format_datetime(
                             analysis_time
                         ),  # Data source remains the same
@@ -3074,6 +3072,184 @@ class Command(BaseCommand):
 
 
 # floorplan/management/commands/__init__.py
+
+
+# floorplan/management/commands/export_analysis_records.py
+# floorplan/management/commands/export_fp_analysis_records.py
+
+import csv
+import sys
+
+from django.core.management.base import BaseCommand, CommandError
+
+# --- Updated Import ---
+# Import models from the 'floorplan' app
+from floorplan.models import AllFloorsData, FloorPlan, FloorPlanAnalysisResult
+
+# --- End Updated Import ---
+
+
+class Command(BaseCommand):
+    # Help text can remain similar, focusing on the action
+    help = (
+        "Exports floor plan analysis records (user_id, property_id, original_url, floorplan_data_url) "
+        "from the 'floorplan' app models for a specific user ID to a CSV file."
+    )
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "output_file",
+            nargs="?",
+            type=str,
+            help="Optional path to the output CSV file. If not provided, output will be written to stdout.",
+            default=None,
+        )
+        # Keep the user_id argument for flexibility
+        parser.add_argument(
+            "--user_id",
+            type=str,
+            # You might want to remove the default here if you always want to specify it
+            # Or keep it if 'FloorplanTest290425' is still the most common use case
+            default="FloorplanTest290425",
+            help="Filter records for a specific user ID.",
+        )
+
+    def handle(self, *args, **options):
+        output_file = options["output_file"]
+        specific_user_id = options["user_id"]  # Get user_id from argument
+
+        output_stream = (
+            open(output_file, "w", newline="", encoding="utf-8")
+            if output_file
+            else sys.stdout
+        )
+
+        self.stdout.write(
+            f"Exporting 'floorplan' app analysis records for user_id: {specific_user_id}..."  # Added 'floorplan' app context
+        )
+        if output_file:
+            self.stdout.write(f"Output file: {output_file}")
+        else:
+            self.stdout.write(f"Outputting to stdout")
+
+        # Prepare CSV writer - fieldnames are the same
+        fieldnames = ["user_id", "property_id", "original_url", "floorplan_data_url"]
+        writer = csv.DictWriter(output_stream, fieldnames=fieldnames)
+        writer.writeheader()
+
+        count = 0
+        processed_count = 0
+
+        # --- Query Modification ---
+        # Query FloorPlan from floorplan.models
+        # Filter based on the user_id in the related FloorPlanAnalysisResult
+        floor_plans_query = (
+            FloorPlan.objects.filter(analysis_result__user_id=specific_user_id)
+            .select_related(
+                "analysis_result",  # Gets FloorPlanAnalysisResult
+                # --- Updated Related Name ---
+                # Use the related_name defined in floorplan.models.AllFloorsData ('all_floors_data')
+                # This refers to the reverse relationship from FloorPlan to AllFloorsData
+                "all_floors_data",
+                # --- End Updated Related Name ---
+            )
+            .order_by("created_at")
+        )
+        # --- End Query Modification ---
+
+        total_plans = floor_plans_query.count()
+        self.stdout.write(
+            f"Found {total_plans} 'floorplan' app records for user '{specific_user_id}' to process."  # Added context
+        )
+
+        if total_plans == 0:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"No 'floorplan' app records found for user '{specific_user_id}'. Exiting."  # Added context
+                )
+            )
+            if output_file:
+                output_stream.close()
+            return
+
+        for floor_plan in floor_plans_query.iterator():
+            processed_count += 1
+            if processed_count % 100 == 0:
+                self.stdout.write(
+                    f"Processed {processed_count}/{total_plans} records..."
+                )
+
+            try:
+                analysis_result = floor_plan.analysis_result
+                user_id = analysis_result.user_id
+                property_id = analysis_result.property_id
+                original_url = floor_plan.original_url
+
+                floorplan_data_url = ""
+
+                try:
+                    # --- Updated Attribute Access ---
+                    # Access the related AllFloorsData using the correct related_name from the model definition
+                    all_floors_data = floor_plan.all_floors_data
+                    # --- End Updated Attribute Access ---
+                    if all_floors_data.csv_url:
+                        floorplan_data_url = all_floors_data.csv_url
+                    elif all_floors_data.json_file_url:
+                        floorplan_data_url = all_floors_data.json_file_url
+
+                except AllFloorsData.DoesNotExist:
+                    # This is expected if analysis didn't generate AllFloorsData yet
+                    pass
+                except AttributeError:
+                    # This might happen if the select_related failed or the relation is somehow broken
+                    self.stderr.write(
+                        self.style.WARNING(
+                            # Use the correct attribute name in the warning
+                            f"Could not access all_floors_data for FloorPlan ID {floor_plan.id}"
+                        )
+                    )
+
+                # Double check user_id (optional paranoia)
+                if user_id != specific_user_id:
+                    self.stderr.write(
+                        self.style.WARNING(
+                            f"Record {floor_plan.id} has unexpected user_id '{user_id}'. Skipping write (should not happen due to filter)."
+                        )
+                    )
+                    continue
+
+                writer.writerow(
+                    {
+                        "user_id": user_id,
+                        "property_id": property_id,
+                        "original_url": original_url,
+                        "floorplan_data_url": floorplan_data_url,
+                    }
+                )
+                count += 1
+
+            except FloorPlanAnalysisResult.DoesNotExist:
+                self.stderr.write(
+                    self.style.WARNING(
+                        f"Skipping FloorPlan ID {floor_plan.id} due to missing FloorPlanAnalysisResult (unexpected)."
+                    )
+                )
+            except Exception as e:
+                self.stderr.write(
+                    self.style.ERROR(
+                        f"Error processing FloorPlan ID {floor_plan.id}: {e}"
+                    )
+                )
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Successfully exported {count} 'floorplan' app analysis records for user '{specific_user_id}'."  # Added context
+            )
+        )
+
+        if output_file:
+            output_stream.close()
+            self.stdout.write(self.style.SUCCESS(f"Output saved to {output_file}"))
 
 
 # floorplan/management/commands/check_sdb_fp_consistency.py
@@ -4834,6 +5010,416 @@ class Command(BaseCommand):
         )
 
 
+# floorplan/management/commands/sync_total_areas.py
+# floorplan/management/commands/sync_total_areas.py
+
+import csv
+import io
+import logging
+import time
+
+import requests
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+from django.utils import timezone  # Use timezone for comparisons if needed
+
+# Import necessary models
+from floorplan.models import (
+    AllFloorsData,
+    FloorPlan,
+    FloorPlanAnalysisResult,
+    TotalAreasCsvData,
+)
+
+# Import necessary helpers (assuming they are defined in tasks.py or a utils file)
+# If not, copy their definitions into this file or a shared utils file.
+from floorplan.tasks import (
+    _process_total_area_csv,  # Assuming this function is defined in tasks.py
+)
+from floorplan.tasks import (  # Add safe_float, safe_int, safe_string if _process_total_area_csv needs them directly; and they aren't imported within it.
+    _download_csv_content,
+)
+
+logger = logging.getLogger(__name__)  # Use Django's logging
+
+# --- User ID Mapping ---
+# Map from the ID stored in *your database* back to the ID the *API expects*
+DB_TO_API_USER_ID_MAP = {
+    "8": "447841869529",
+    "2": "2347033588400",
+}
+
+
+class Command(BaseCommand):
+    help = "Fetches the latest total_area_csv_url from the API for floorplans and updates the corresponding TotalAreasCsvData."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--api-url",
+            default=getattr(
+                settings, "FLOORPLAN_API_BASE_URL", "http://165.232.101.36"
+            ),
+            help="Base URL of the floorplan API.",
+        )
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            help="Limit the number of FloorPlan records to process.",
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=0.1,
+            help="Delay in seconds between API calls.",
+        )
+        parser.add_argument(
+            "--force-update",
+            action="store_true",
+            help="Force processing of the CSV even if the URL hasn't changed.",
+        )
+        parser.add_argument(
+            "--floorplan-pk",
+            type=int,
+            default=None,
+            help="Process only a specific FloorPlan primary key.",
+        )
+
+    def handle(self, *args, **options):
+        api_base_url = options["api_url"]
+        limit = options["limit"]
+        delay = options["delay"]
+        force_update = options["force_update"]
+        specific_pk = options["floorplan_pk"]
+
+        if not api_base_url:
+            raise CommandError(
+                "API Base URL is not configured. Use --api-url or set FLOORPLAN_API_BASE_URL in settings."
+            )
+
+        api_endpoint = f"{api_base_url.rstrip('/')}/get-floorplan-data-by-user-property"
+
+        self.stdout.write(self.style.SUCCESS(f"--- Starting Total Area CSV Sync ---"))
+        self.stdout.write(f"Using API endpoint: {api_endpoint}")
+        if limit:
+            self.stdout.write(f"Limiting processing to {limit} records.")
+        if specific_pk:
+            self.stdout.write(f"Processing only FloorPlan PK: {specific_pk}")
+        if force_update:
+            self.stdout.write(
+                self.style.WARNING(
+                    "Force update enabled: CSV will be processed even if URL is unchanged."
+                )
+            )
+
+        # --- Query Preparation ---
+        floorplan_queryset = FloorPlan.objects.select_related(
+            "analysis_result", "all_floors_data"
+        )
+
+        if specific_pk:
+            floorplan_queryset = floorplan_queryset.filter(pk=specific_pk)
+            if not floorplan_queryset.exists():
+                raise CommandError(f"FloorPlan with PK {specific_pk} not found.")
+        elif limit:
+            floorplan_queryset = floorplan_queryset[:limit]
+
+        # --- Stats Counters ---
+        processed_count = 0
+        updated_count = 0
+        skipped_no_afd = 0
+        skipped_no_analysis = 0
+        api_errors = 0
+        api_errors_fallback = 0
+        url_missing_errors = 0
+        processing_errors = 0
+        fallback_attempts = 0
+        fallback_success = 0
+
+        # --- Main Loop ---
+        start_time = time.time()
+        # Use iterator for memory efficiency
+        for floorplan in floorplan_queryset.iterator():
+            processed_count += 1
+            if processed_count % 50 == 0:
+                elapsed = time.time() - start_time
+                self.stdout.write(
+                    f"  Processed {processed_count} floorplans... ({elapsed:.2f}s elapsed)"
+                )
+
+            # --- Basic Checks ---
+            if not floorplan.analysis_result:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Skipping FloorPlan PK {floorplan.pk} (Hash: {floorplan.floorplan_id[:8]}...) - Missing Analysis Result"
+                    )
+                )
+                skipped_no_analysis += 1
+                continue
+
+            if (
+                not hasattr(floorplan, "all_floors_data")
+                or floorplan.all_floors_data is None
+            ):
+                logger.debug(
+                    f"Skipping FloorPlan PK {floorplan.pk} (Hash: {floorplan.floorplan_id[:8]}...) - No AllFloorsData linked"
+                )
+                skipped_no_afd += 1
+                continue
+
+            db_user_id = floorplan.analysis_result.user_id
+            property_id = floorplan.analysis_result.property_id
+
+            if not db_user_id or not property_id:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Skipping FloorPlan PK {floorplan.pk} - Missing user_id or property_id in AnalysisResult PK {floorplan.analysis_result.pk}"
+                    )
+                )
+                skipped_no_analysis += 1
+                continue
+
+            # --- API Call with Fallback Logic ---
+            api_data = None
+            api_error_occurred = False
+            current_api_error_count = api_errors  # Store current count before attempts
+
+            # 1. Try with the DB User ID first
+            self.stdout.write(
+                f"Attempting API call for DB User ID: {db_user_id}, Prop ID: {property_id} (FP PK: {floorplan.pk})"
+            )
+            try:
+                response = requests.get(
+                    api_endpoint,
+                    params={"user_id": db_user_id, "property_id": property_id},
+                    timeout=45,
+                )
+                # Check for specific non-success codes that might warrant a fallback
+                # A 404 is a good candidate. Maybe 5xx errors too?
+                if response.status_code == 404:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"  API returned 404 for DB User ID {db_user_id}. Checking for fallback..."
+                        )
+                    )
+                    api_error_occurred = True  # Mark error to trigger fallback check
+                elif not response.ok:  # Handle other non-2xx errors
+                    response.raise_for_status()  # Raise HTTPError for other bad statuses
+                else:
+                    api_data = response.json()  # Success!
+                    self.stdout.write(
+                        f"  API call successful for DB User ID {db_user_id}."
+                    )
+
+            except requests.Timeout:
+                logger.error(
+                    f"Timeout calling API for FloorPlan PK {floorplan.pk} (DB User: {db_user_id}, Prop: {property_id})"
+                )
+                api_errors += 1
+                api_error_occurred = True
+            except requests.RequestException as e:
+                status_code = getattr(e.response, "status_code", "N/A")
+                response_text = getattr(e.response, "text", "N/A")[:200]
+                logger.error(
+                    f"API Request Error for FloorPlan PK {floorplan.pk} (DB User: {db_user_id}, Prop: {property_id}): {e} (Status: {status_code}) Response: {response_text}"
+                )
+                api_errors += 1
+                api_error_occurred = (
+                    True  # Mark error to trigger fallback if applicable
+                )
+
+            # 2. Try Fallback if needed and possible
+            api_user_id = DB_TO_API_USER_ID_MAP.get(db_user_id)
+            if api_error_occurred and api_user_id:
+                self.stdout.write(
+                    self.style.NOTICE(
+                        f"  Attempting fallback API call for API User ID: {api_user_id}, Prop ID: {property_id}"
+                    )
+                )
+                fallback_attempts += 1
+                try:
+                    response = requests.get(
+                        api_endpoint,
+                        params={"user_id": api_user_id, "property_id": property_id},
+                        timeout=45,
+                    )
+                    response.raise_for_status()  # Raises error for non-2xx status codes
+                    api_data = response.json()  # Success on fallback!
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            f"  Fallback API call successful for API User ID {api_user_id}."
+                        )
+                    )
+                    fallback_success += 1
+                    # Reset api_error_occurred as fallback succeeded
+                    api_error_occurred = False
+                    # If the *first* call failed but this one worked, don't increment the overall api_errors count
+                    if api_errors > current_api_error_count:
+                        api_errors = current_api_error_count  # Correct the count
+                        api_errors_fallback += (
+                            1  # Keep track of errors that needed fallback
+                        )
+
+                except requests.Timeout:
+                    logger.error(
+                        f"Timeout on fallback API call for FloorPlan PK {floorplan.pk} (API User: {api_user_id}, Prop: {property_id})"
+                    )
+                    api_errors_fallback += 1  # Track fallback specific errors
+                    # Keep api_error_occurred = True
+                except requests.RequestException as e:
+                    status_code = getattr(e.response, "status_code", "N/A")
+                    response_text = getattr(e.response, "text", "N/A")[:200]
+                    logger.error(
+                        f"Fallback API Request Error for FloorPlan PK {floorplan.pk} (API User: {api_user_id}, Prop: {property_id}): {e} (Status: {status_code}) Response: {response_text}"
+                    )
+                    api_errors_fallback += 1  # Track fallback specific errors
+                    # Keep api_error_occurred = True
+
+            # If api_data is still None after potential fallback, skip this floorplan
+            if api_data is None:
+                self.stdout.write(
+                    self.style.ERROR(
+                        f"  Skipping FloorPlan PK {floorplan.pk} after failed API attempts."
+                    )
+                )
+                continue  # Move to the next floorplan
+
+            # --- Process Successful API Response ---
+            total_area_url = None
+            try:
+                # --- Safely Extract URL ---
+                output_data = api_data.get("output_data")
+                if isinstance(output_data, list) and len(output_data) > 0:
+                    first_output_item = output_data[0]
+                    if isinstance(first_output_item, dict):
+                        # Prefer matching floorplan_id if possible
+                        response_fp_id = first_output_item.get("floorplan_id")
+                        if response_fp_id == floorplan.floorplan_id:
+                            all_floors_dict = first_output_item.get("all_floors")
+                            if isinstance(all_floors_dict, dict):
+                                total_area_url = all_floors_dict.get(
+                                    "total_area_csv_url"
+                                )
+                        else:
+                            logger.warning(
+                                f"API response floorplan_id ({response_fp_id}) "
+                                f"does not match current FloorPlan ({floorplan.floorplan_id}) "
+                                f"for User: {db_user_id}, Prop: {property_id}. Using URL from first item anyway."
+                            )
+                            all_floors_dict = first_output_item.get("all_floors")
+                            if isinstance(all_floors_dict, dict):
+                                total_area_url = all_floors_dict.get(
+                                    "total_area_csv_url"
+                                )
+
+                if not total_area_url:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"No 'total_area_csv_url' found in API response for FloorPlan PK {floorplan.pk} (User: {db_user_id}, Prop: {property_id})"
+                        )
+                    )
+                    url_missing_errors += 1
+                    continue  # Skip to next floorplan
+
+                self.stdout.write(f"  Found total_area_csv_url: {total_area_url}")
+
+                # --- Update AllFloorsData URL and Process CSV ---
+                all_floors_data_instance = floorplan.all_floors_data
+
+                needs_update = (
+                    all_floors_data_instance.total_area_csv_url != total_area_url
+                )
+
+                if needs_update:
+                    self.stdout.write(
+                        f"  Updating total_area_csv_url for AllFloorsData PK {all_floors_data_instance.pk}"
+                    )
+                    all_floors_data_instance.total_area_csv_url = total_area_url
+                    try:
+                        with transaction.atomic():
+                            all_floors_data_instance.save(
+                                update_fields=["total_area_csv_url", "updated_at"]
+                            )
+                    except Exception as save_exc:
+                        logger.error(
+                            f"Failed to save updated URL for AllFloorsData PK {all_floors_data_instance.pk}: {save_exc}"
+                        )
+                        processing_errors += 1
+                        continue  # Skip CSV processing if save failed
+
+                # Process CSV if URL updated OR if force_update is True
+                if needs_update or force_update:
+                    self.stdout.write(
+                        f"  Processing CSV for FloorPlan PK {floorplan.pk}..."
+                    )
+                    try:
+                        # _process_total_area_csv handles its own transaction
+                        _process_total_area_csv(all_floors_data_instance)
+                        updated_count += 1
+                        self.stdout.write(
+                            self.style.SUCCESS(
+                                f"    Successfully processed total area CSV."
+                            )
+                        )
+                    except Exception as proc_exc:
+                        logger.exception(
+                            f"Error processing total area CSV for AFD PK {all_floors_data_instance.pk} (FP PK {floorplan.pk}): {proc_exc}"
+                        )
+                        processing_errors += 1
+                else:
+                    self.stdout.write(
+                        f"  Skipping CSV processing for FP PK {floorplan.pk} (URL unchanged and --force-update not set)."
+                    )
+
+            except Exception as e:
+                logger.exception(
+                    f"Unexpected error processing API data or CSV for FloorPlan PK {floorplan.pk}: {e}"
+                )
+                processing_errors += 1  # Count as processing error
+
+            # Optional delay
+            if delay > 0:
+                time.sleep(delay)
+
+        # --- End of Loop ---
+
+        # --- Final Summary ---
+        end_time = time.time()
+        duration = end_time - start_time
+        self.stdout.write(self.style.SUCCESS("\n--- Sync Complete ---"))
+        self.stdout.write(f"Duration: {duration:.2f} seconds")
+        self.stdout.write(f"FloorPlans Checked: {processed_count}")
+        self.stdout.write(f"CSVs Updated/Processed: {updated_count}")
+        self.stdout.write(f"Skipped (No AnalysisResult/ID): {skipped_no_analysis}")
+        self.stdout.write(f"Skipped (No AllFloorsData): {skipped_no_afd}")
+        self.stdout.write(f"API URL Missing in Response: {url_missing_errors}")
+        self.stdout.write(
+            self.style.WARNING(
+                f"Initial API Errors (incl. 404s): {api_errors + api_errors_fallback}"
+            )
+        )  # Total errors encountered before potential fallback success
+        self.stdout.write(
+            self.style.WARNING(f"Fallback API Attempts: {fallback_attempts}")
+        )
+        self.stdout.write(
+            self.style.WARNING(f"Fallback API Successes: {fallback_success}")
+        )
+        self.stdout.write(
+            self.style.WARNING(f"Fallback API Errors: {api_errors_fallback}")
+        )  # Errors specifically on the fallback call
+        self.stdout.write(
+            self.style.ERROR(f"CSV Processing Errors: {processing_errors}")
+        )
+        if (
+            processing_errors > 0
+            or (api_errors + api_errors_fallback) > fallback_success
+        ):
+            self.stderr.write(
+                self.style.ERROR("Errors occurred. Please check the logs.")
+            )
+
+
 # floorplan/utils/backup.py
 # floorplan/utils/backup.py
 import requests
@@ -5169,5 +5755,1170 @@ Property ID,User ID,Property URL,Floorplan URLs,Status,Timestamp
 58,10,https://www.rightmove.co.uk/properties/158508347,https://media.rightmove.co.uk/55k/54899/158508347/54899_ef2e3c45-d5d0-4ca3-b7fe-718d5542617c_FLP_00_0000.jpeg,Triggered,2025-04-07 11:18:31
 59,8,https://www.rightmove.co.uk/properties/158701067,https://media.rightmove.co.uk/87k/86777/158701067/86777_KNA220532_FLP_00_0000.jpeg,Triggered,2025-04-07 11:19:01
 61,8,https://www.rightmove.co.uk/properties/153638363,https://media.rightmove.co.uk/108k/107488/153638363/107488_Eaton_FLP_00_0000.jpeg,Triggered,2025-04-07 11:19:31
+
+
+# helpers/models.py
+from django.db import models
+
+
+class TrackingModel(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+        ordering = ("-created_at",)
+
+
+# helpers/__init__.py
+
+
+# accounts/models.py
+import uuid
+from datetime import timedelta
+
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from django_countries.fields import CountryField
+
+from helpers.models import TrackingModel
+
+GENDER_CHOICES = (("M", "Male"), ("F", "Female"))
+
+
+class UserManager(BaseUserManager):
+    use_in_migrations = True
+
+    def _create_user(self, email, password, **extra_fields):
+        if not email:
+            raise ValueError("Users require an email field")
+
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_user(self, email, password=None, **extra_fields):
+        extra_fields.setdefault("is_staff", False)
+        extra_fields.setdefault("is_superuser", False)
+        return self._create_user(email, password, **extra_fields)
+
+    def create_superuser(self, email, password, **extra_fields):
+        extra_fields.setdefault("is_staff", True)
+        extra_fields.setdefault("is_superuser", True)
+
+        if extra_fields.get("is_staff") is not True:
+            raise ValueError("Superuser must have is_staff=True.")
+        if extra_fields.get("is_superuser") is not True:
+            raise ValueError("Superuser must have is_superuser=True.")
+
+        return self._create_user(email, password, **extra_fields)
+
+
+class User(AbstractUser, TrackingModel):
+    email = models.EmailField(
+        _("email address"), db_index=True, blank=True, null=True, unique=True
+    )
+    username = models.CharField(
+        _("username"), max_length=30, blank=True, null=True, unique=False
+    )
+    phone = models.CharField(max_length=60, blank=True, null=True)
+    gender = models.CharField(
+        max_length=1, choices=GENDER_CHOICES, blank=True, null=True
+    )
+    date_of_birth = models.DateField(null=True, blank=True)
+    profile_picture = models.ImageField(
+        upload_to="profile_pics/", null=True, blank=True
+    )
+
+    email_verification_token = models.CharField(max_length=128, null=True, blank=True)
+    email_verified = models.BooleanField(
+        _("email verified"),
+        default=False,
+        help_text="Designates whether this users email is verified.",
+    )
+
+    objects = UserManager()
+
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = []
+
+    def __str__(self):
+        return "{}".format(self.email)
+
+    class Meta:
+        verbose_name = _("User")
+        verbose_name_plural = _("Users")
+
+
+class OrganizationProfile(TrackingModel):
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="organization_profile"
+    )
+    name = models.CharField(max_length=100)
+    bio = models.TextField(max_length=500, blank=True, null=True)
+
+    # organization address
+    city = models.CharField(max_length=50, blank=True, null=True)
+    address = models.CharField(max_length=255, null=True, blank=True)
+    address2 = models.CharField(max_length=255, null=True, blank=True)
+    country = CountryField(multiple=False, null=True, blank=True)
+    zip_code = models.CharField(max_length=200, null=True, blank=True)
+
+    def __str__(self):
+        return "{}".format(self.name)
+
+    class Meta:
+        verbose_name = _("Organization")
+        verbose_name_plural = _("Organizations")
+
+
+class UserToken(models.Model):
+    phone_number = models.CharField(max_length=20)
+    token = models.UUIDField(default=uuid.uuid4, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+# accounts/serializers.py
+from django.contrib.auth.password_validation import validate_password
+from rest_framework import serializers
+
+from accounts import models
+
+
+class OrganizationProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.OrganizationProfile
+        # fields = '__all__'
+        fields = ["name", "country"]  # added to registration form
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, validators=[validate_password])
+    country = serializers.CharField(write_only=True, required=False)
+
+    class Meta:
+        model = models.User
+        fields = ["email", "password", "country", "first_name", "last_name"]
+        extra_kwargs = {
+            "first_name": {"required": False},
+            "last_name": {"required": False},
+        }
+
+    def create(self, validated_data):
+        country = validated_data.pop("country", None)
+        user = models.User.objects.create_user(**validated_data)
+        if country:
+            models.OrganizationProfile.objects.create(user=user, country=country)
+        return user
+
+
+class UserSerializer(serializers.ModelSerializer):
+    full_name = serializers.CharField(source="get_full_name", read_only=True)
+    user_role = serializers.CharField(source="get_user_role", read_only=True)
+
+    class Meta:
+        model = models.User
+        # fields = '__all__'
+        exclude = ["password", "groups", "user_permissions"]
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """
+    Serializer for password change endpoint.
+    """
+
+    old_password = serializers.CharField(required=True)
+    new_password = serializers.CharField(required=True)
+
+
+class ResetPasswordRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+# accounts/__init__.py
+
+
+# accounts/apps.py
+from django.apps import AppConfig
+
+
+class AccountsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "accounts"
+
+
+# accounts/forms.py
+from django import forms
+from django.contrib.auth.forms import (
+    AuthenticationForm,
+    PasswordChangeForm,
+    PasswordResetForm,
+    UserCreationForm,
+)
+from django.utils.translation import gettext_lazy as _
+
+from accounts.models import User
+
+
+class UserLoginForm(AuthenticationForm):
+    username = forms.EmailField(
+        required=True,
+        label=_("Email: "),
+        widget=forms.TextInput(
+            attrs={
+                "type": "email",
+                "class": "form-control form-control-user",
+                "id": "exampleInputEmail",
+                "aria-describedby": "emailHelp",
+                "placeholder": "Enter Email Address...",
+            }
+        ),
+    )
+    password = forms.CharField(
+        widget=forms.PasswordInput(
+            attrs={
+                "type": "password",
+                "class": "form-control form-control-user",
+                "placeholder": "Password",
+                "id": "exampleInputPassword",
+            }
+        )
+    )
+
+    # ADD REMEMBER ME
+    class Meta:
+        model = User
+        fields = ("username", "password")
+
+
+class SignUpForm(UserCreationForm):
+    email = forms.EmailField(
+        max_length=254,
+        required=True,
+        help_text=_("Required. Enter a valid email address."),
+        widget=forms.EmailInput(
+            attrs={
+                "class": "form-control form-control-user",
+                "id": "exampleInputEmail",
+                "type": "email",
+                "placeholder": "Email Address",
+            }
+        ),
+    )
+    first_name = forms.CharField(
+        max_length=30,
+        required=True,
+        help_text=_("Enter First Name."),
+        widget=forms.TextInput(
+            attrs={
+                "type": "text",
+                "class": "form-control form-control-user",
+                "id": "exampleFirstName",
+                "placeholder": "First Name",
+            }
+        ),
+    )
+    last_name = forms.CharField(
+        max_length=30,
+        required=True,
+        help_text=_("Enter Last Name."),
+        widget=forms.TextInput(
+            attrs={
+                "type": "text",
+                "class": "form-control form-control-user",
+                "id": "exampleLastName",
+                "placeholder": "Last Name",
+            }
+        ),
+    )
+    password1 = forms.CharField(
+        max_length=22,
+        min_length=8,
+        required=True,
+        widget=forms.PasswordInput(
+            attrs={
+                "class": "form-control form-control-user",
+                "id": "exampleInputPassword",
+                "type": "password",
+                "placeholder": "Password",
+                "maxlength": "22",
+                "minlength": "8",
+            }
+        ),
+    )
+    password2 = forms.CharField(
+        max_length=22,
+        min_length=8,
+        required=True,
+        widget=forms.PasswordInput(
+            attrs={
+                "class": "form-control form-control-user",
+                "id": "exampleInputPassword",
+                "type": "password",
+                "placeholder": "Repeat Password",
+                "maxlength": "22",
+                "minlength": "8",
+            }
+        ),
+    )
+
+    def clean_email(self):
+        email = self.cleaned_data.get("email")
+        if email and User.objects.filter(email=email).exists():
+            raise forms.ValidationError(
+                f"This email address is already in use. Please use a different email."
+            )
+        return email
+
+    class Meta:
+        model = User
+        fields = (
+            "email",
+            "first_name",
+            "last_name",
+            "password1",
+            "password2",
+            "phone",  # Not sure this is needed it is not in the front page
+        )
+
+
+class CustomPasswordResetForm(PasswordResetForm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["email"].widget.attrs.update(
+            {
+                "class": "form-control form-control-user",
+                "placeholder": "Enter Email Address...",
+            }
+        )
+
+
+class ChangePasswordForm(PasswordChangeForm):
+    old_password = forms.CharField(
+        widget=forms.TextInput(
+            attrs={"class": "form-control mb-3", "placeholder": "Old Password"}
+        ),
+    )
+    new_password1 = forms.CharField(
+        widget=forms.TextInput(
+            attrs={"class": "form-control mb-3", "placeholder": "New Password"}
+        ),
+    )
+    new_password2 = forms.CharField(
+        widget=forms.TextInput(
+            attrs={"class": "form-control mb-3", "placeholder": "Confirm New Password"}
+        ),
+    )
+
+    class Meta:
+        model = User
+        fields = (
+            "old_password",
+            "new_password1",
+            "new_password2",
+        )
+
+
+# accounts/admin.py
+from django.contrib import admin
+from django.utils.html import format_html
+
+from accounts.models import OrganizationProfile, User, UserToken
+
+
+class UserAdmin(admin.ModelAdmin):
+    list_display = [
+        "id",
+        "email",
+        "username",
+        "phone",
+        "gender",
+        "email_verified",
+    ]
+    list_filter = ["email_verified", "date_of_birth"]
+    search_fields = ["email", "username", "phone"]
+
+
+class OrganizationProfileAdmin(admin.ModelAdmin):
+    list_display = ["id", "name", "bio", "city", "address", "country", "zip_code"]
+    list_filter = ["city", "country"]
+    search_fields = ["name", "bio", "city", "address", "zip_code"]
+    raw_id_fields = ["user"]
+
+
+class UserTokenAdmin(admin.ModelAdmin):
+    list_display = [
+        "phone_number",
+        "token",
+        "created_at",
+    ]
+    list_filter = ["phone_number"]
+    search_fields = ["phone_number"]
+
+
+admin.site.register(User, UserAdmin)
+admin.site.register(OrganizationProfile, OrganizationProfileAdmin)
+admin.site.register(UserToken, UserTokenAdmin)
+
+
+# accounts/pagination.py
+from rest_framework import pagination
+
+
+class CustomPageNumberPagination(pagination.PageNumberPagination):
+    page_size = 1
+    page_size_query_param = "count"
+    max_page_size = 5
+    page_query_param = "p"
+
+
+# accounts/tests.py
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# accounts/urls.py
+from django.conf import settings
+from django.conf.urls.static import static
+from django.contrib.auth import views as auth_views
+from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+from django.urls import include, path
+from rest_framework import routers
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+    TokenVerifyView,
+)
+
+from accounts import forms, views
+
+router = routers.DefaultRouter()
+
+router.register(r"users", views.UserViewSet, basename="user")
+
+admin_urls = [
+    path("", include(router.urls)),
+    path("user/", views.CurrentUserDetailView.as_view(), name="current_user"),
+]
+
+manual_tokens = [
+    path(
+        "generate-token/",
+        views.GenerateTokenView.as_view(),
+        name="generate_auth",
+    ),
+    path(
+        "authenticate-token/",
+        views.TokenAuthenticationView.as_view(),
+        name="authenticate_auth",
+    ),
+    path(
+        "authenticate-phone/",
+        views.PhoneAuthenticationView.as_view(),
+        name="authenticate-phone",
+    ),
+    path(
+        "check-authenticated/",
+        views.CheckAuthenticatedView.as_view(),
+        name="check-authenticated",
+    ),
+]
+
+jwt_urls = [
+    path("token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
+    path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path("token/verify/", TokenVerifyView.as_view(), name="token_verify"),
+    path("change-password", views.ChangePasswordView.as_view(), name="change_password"),
+    path(
+        "password-reset/",
+        include("django_rest_passwordreset.urls", namespace="password_reset"),
+    ),
+]
+
+account_urls = [
+    # path("signup/", views.RegisterAPIView.as_view(), name="signup"),
+    # path('verify-email/<str:token>/', views.VerifyEmailView.as_view(), name='verify_email'),
+    # path('resend-verification/', views.ResendVerificationEmailView.as_view(), name='resend_verification'),
+    path(
+        "login/",
+        auth_views.LoginView.as_view(
+            template_name="account/login.html", authentication_form=forms.UserLoginForm
+        ),
+        name="login",
+    ),
+    # path("logout/", auth_views.LogoutView.as_view(), name="logout"),
+    path("logout/", views.LogoutView.as_view(), name="auth_logout"),
+]
+
+password_urls = [
+    # path("change-password/", views.ChangePassword.as_view(), name="change_password"),
+    path(
+        "password-reset/",
+        auth_views.PasswordResetView.as_view(
+            form_class=forms.CustomPasswordResetForm,
+            template_name="account/password/password_reset.html",
+            subject_template_name="account/password/password_reset_subject.txt",
+            email_template_name="account/password/password_reset_email.html",
+            from_email=settings.EMAIL_HOST_USER,
+            # success_url='/login/'
+        ),
+        name="password_reset",
+    ),
+    path(
+        "password-reset/done/",
+        auth_views.PasswordResetDoneView.as_view(
+            template_name="account/password/password_reset_done.html"
+        ),
+        name="password_reset_done",
+    ),
+    path(
+        "password-reset-confirm/<uidb64>/<token>/",
+        auth_views.PasswordResetConfirmView.as_view(
+            template_name="account/password/password_reset_confirm.html"
+        ),
+        name="password_reset_confirm",
+    ),
+    path(
+        "password-reset-complete/",
+        auth_views.PasswordResetCompleteView.as_view(
+            template_name="account/password/password_reset_complete.html"
+        ),
+        name="password_reset_complete",
+    ),
+]
+
+urlpatterns = admin_urls + jwt_urls + account_urls + password_urls + manual_tokens
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+urlpatterns += staticfiles_urlpatterns()
+
+
+# accounts/views.py
+import uuid
+from datetime import timedelta
+from typing import Any
+
+import jwt
+from django.conf import settings
+from django.contrib.auth import authenticate, login
+from django.core.mail import send_mail
+from django.http import JsonResponse
+from django.middleware.csrf import get_token
+from django.shortcuts import redirect
+from django.utils import timezone
+from django.utils.crypto import get_random_string
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, generics, status, viewsets
+from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.generics import GenericAPIView
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken, TokenError
+
+from accounts.models import User, UserToken
+from accounts.pagination import CustomPageNumberPagination
+from accounts.serializers import (
+    ChangePasswordSerializer,
+    RegisterSerializer,
+    UserSerializer,
+)
+
+# from utils.email_utils import send_verification_email
+
+
+@method_decorator(ensure_csrf_cookie, name="dispatch")
+class GetCSRFToken(APIView):
+    def get(self, request):
+        csrf_token = get_token(request)
+        return JsonResponse({"success": "CSRF cookie set", "csrftoken": csrf_token})
+
+
+class GenerateTokenView(APIView):
+    """
+    Generate authentication token for phone number.
+
+    This endpoint generates a new token or retrieves an existing one for the provided phone number.
+    """
+
+    def post(self, request):
+        """
+        Generate token for authentication.
+
+        Parameters:
+            phone_number (str): User's phone number
+
+        Returns:
+            token (str): Generated authentication token
+
+        Raises:
+            400: If phone number is not provided
+        """
+        phone_number = request.data.get("phone_number")
+        if not phone_number:
+            return Response(
+                {"error": "Phone number is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_token, created = UserToken.objects.get_or_create(phone_number=phone_number)
+        return Response({"token": str(user_token.token)}, status=status.HTTP_200_OK)
+
+
+class TokenAuthenticationView(APIView):
+    """
+    Authenticate user using generated token.
+
+    This endpoint validates the token and returns JWT tokens for further authentication.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        """
+        Authenticate using token.
+
+        Parameters:
+            token (str): Authentication token previously generated
+
+        Returns:
+            refresh (str): JWT refresh token
+            access (str): JWT access token
+            message (str): Success message
+            user (dict): User details including id and phone
+
+        Raises:
+            400: If token is invalid or not provided
+        """
+        token = request.data.get("token")
+        if not token:
+            return Response(
+                {"error": "Token is required."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user_token = UserToken.objects.get(token=token)
+
+            # Get or create the user
+            user, created = User.objects.get_or_create(phone=user_token.phone_number)
+
+            # Generate JWT tokens with additional claims
+            refresh = RefreshToken.for_user(user)
+            refresh["phone"] = user.phone  # Add phone number to token claims
+            refresh["user_id"] = user.id  # Add the user_id claim
+            access_token = str(refresh.access_token)
+
+            return Response(
+                {
+                    "refresh": str(refresh),
+                    "access": access_token,
+                    "message": "Authenticated successfully.",
+                    "user": {"id": user.id, "phone": user.phone},
+                },
+                status=status.HTTP_200_OK,
+            )
+        except UserToken.DoesNotExist:
+            return Response(
+                {"error": "Invalid token."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class PhoneAuthenticationView(APIView):
+    def post(self, request):
+        phone_number = request.data.get("phone_number")
+        if not phone_number:
+            return Response(
+                {"error": "Phone number is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Best practice, send an OTP here
+        # For now, we'll authenticate directly (Note: This is not secure)
+        user, created = User.objects.get_or_create(phone=phone_number)
+
+        # Generate JWT tokens with additional claims
+        refresh = RefreshToken.for_user(user)
+        refresh["phone"] = user.phone  # Add phone number to token claims
+        access_token = str(refresh.access_token)
+
+        return Response(
+            {
+                "refresh": str(refresh),
+                "access": access_token,
+                "message": "Authenticated successfully.",
+                "user": {"id": user.id, "phone": user.phone},
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CheckAuthenticatedView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        print("This is the user: ", request.user.phone)
+        return Response({"message": "Authenticated"}, status=status.HTTP_200_OK)
+
+
+# class RegisterAPIView(GenericAPIView):
+#     """
+#     API endpoint that allows users to be created.
+
+#     Expected payload:
+#     {
+#         "password": "password",
+#         "first_name": "John",
+#         "last_name": "Doe",
+#         "email": "johndoe@example.com",
+#         "country": "NG"
+#     }
+#     """
+#     permission_classes = [AllowAny]
+#     authentication_classes = []
+#     serializer_class = RegisterSerializer
+
+#     def post(self, request: Request) -> Response:
+#         serializer = self.serializer_class(data=request.data)
+
+#         if serializer.is_valid():
+#             user = serializer.save()
+#             user.email_verified = False  # Set email_verified to False initially
+#             user.email_verification_token = get_random_string(64)
+#             user.save()
+
+#             # Send verification email
+#             verification_link = f"{settings.FRONTEND_BASE_URL}/verify-email/{user.email_verification_token}"
+#             email_response = send_verification_email(user.email, verification_link)
+
+#             if email_response.status_code == 200:
+#                 return Response({
+#                     "message": "User registered successfully. Please check your email to verify your account.",
+#                     "user_id": user.id
+#                 }, status=status.HTTP_201_CREATED)
+#             else:
+#                 return Response({
+#                     "message": "User registered successfully, but there was an issue sending the verification email. Please try again later.",
+#                     "user_id": user.id
+#                 }, status=status.HTTP_201_CREATED)
+#         else:
+#             print("Data not valid")
+#             errors = {}
+#             for field, field_errors in serializer.errors.items():
+#                 errors[field] = field_errors[0]  # Take the first error message for each field
+
+#             if 'email' in errors and 'unique' in errors['email'].lower():
+#                 errors['email'] = "A user with this email already exists."
+
+#             if 'password' in errors:
+#                 if 'too short' in errors['password'].lower():
+#                     errors['password'] = "Password is too short. It must be at least 8 characters long."
+#                 elif 'too common' in errors['password'].lower():
+#                     errors['password'] = "This password is too common. Please choose a more unique password."
+#                 elif 'entirely numeric' in errors['password'].lower():
+#                     errors['password'] = "Password cannot be entirely numeric."
+
+#             return Response({"errors": errors}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# class VerifyEmailView(APIView):
+#     def get(self, request, token):
+#         try:
+#             user = User.objects.get(email_verification_token=token)
+#             user.email_verified = True
+#             # user.email_verification_token = ''
+#             user.save()
+#             return Response({"message": "Email verified successfully"}, status=status.HTTP_200_OK)
+#         except User.DoesNotExist:
+#             return Response({"message": "Invalid token"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# class ResendVerificationEmailView(APIView):
+#     def post(self, request):
+#         email = request.data.get('email')
+#         if not email:
+#             return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+#         try:
+#             user = User.objects.get(email=email)
+#             if user.email_verified:
+#                 return Response({"message": "Email is already verified"}, status=status.HTTP_400_BAD_REQUEST)
+
+#             user.email_verification_token = get_random_string(64)
+#             user.save()
+
+#             verification_link = f"{settings.FRONTEND_BASE_URL}/verify-email/{user.email_verification_token}"
+#             email_response = send_verification_email(user.email, verification_link)
+
+#             if email_response.status_code == 200:
+#                 return Response({"message": "Verification email resent successfully"}, status=status.HTTP_200_OK)
+#             else:
+#                 return Response({"message": "Failed to resend verification email"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+#         except User.DoesNotExist:
+#             return Response({"error": "User with this email does not exist"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class LoginView(APIView):
+    def post(self, request: Request) -> Response:
+        email = request.data.get("email")
+        password = request.data.get("password")
+
+        if not email:
+            return Response(
+                {"errors": {"email": ["Email is required"]}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not password:
+            return Response(
+                {"errors": {"password": ["Password is required"]}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = authenticate(email=email, password=password)
+
+        if user is not None:
+            if not user.email_verified:
+                return Response(
+                    {
+                        "errors": {
+                            "email": ["Please verify your email before logging in"]
+                        }
+                    },
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            refresh = RefreshToken.for_user(user)
+            return Response(
+                {
+                    "refresh": str(refresh),
+                    "access": str(refresh.access_token),
+                }
+            )
+
+        user_exists = User.objects.filter(email=email).exists()
+        if user_exists:
+            return Response(
+                {"errors": {"password": ["Invalid password"]}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        else:
+            return Response(
+                {"errors": {"email": ["No account found with this email"]}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+
+class LogoutView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        try:
+            refresh_token = request.data.get("refresh_token")
+            if not refresh_token:
+                return Response(
+                    {"error": "Refresh token is required"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response(status=status.HTTP_205_RESET_CONTENT)
+        except TokenError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            print("This is the error", e)
+            return Response(
+                {"error": "An unexpected error occurred"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint that allows users to be viewed, edited and searched.
+    """
+
+    queryset = User.objects.exclude(is_superuser=True)
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = CustomPageNumberPagination
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    ]
+
+    lookup_field = "id"
+    filterset_fields = ["id", "username", "email"]
+    search_fields = ["id", "username", "email"]
+    ordering_fields = ["id", "username", "email"]
+
+
+class UserView(APIView):
+    def get(self, request: Request) -> Response:
+        token = request.COOKIES.get("jwt")
+
+        if not token:
+            raise AuthenticationFailed("Unauthenticated")
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            raise AuthenticationFailed("Authentication Expired")
+
+        user = User.objects.filter(id=payload["id"]).first()
+        serializer = UserSerializer(user)
+        return Response(serializer.data)
+
+
+class CurrentUserDetailView(APIView):
+    """
+    An endpoint to get the current logged in users' details.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        serializer = UserSerializer(request.user)
+        return Response(serializer.data)
+
+
+class ChangePasswordView(generics.UpdateAPIView):
+    """
+    An endpoint for changing password.
+    """
+
+    serializer_class = ChangePasswordSerializer
+    model = User
+    permission_classes = (IsAuthenticated,)
+
+    def get_object(self, queryset=None):
+        return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+
+        if serializer.is_valid():
+            # Check old password
+            if not self.object.check_password(serializer.data.get("old_password")):
+                return Response(
+                    {"old_password": ["Wrong password."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # set_password also hashes the password that the user will get
+            self.object.set_password(serializer.data.get("new_password"))
+            self.object.save()
+
+            response = {
+                "status": "success",
+                "code": status.HTTP_200_OK,
+                "message": "Password updated successfully",
+            }
+
+            return Response(response)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# accounts/management/__init__.py
+
+
+# accounts/management/commands/__init__.py
+
+
+# accounts/management/commands/populate_db.py
+from typing import Any
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand
+from django.db import IntegrityError
+
+# from accounts.factories import OrganizationProfileFactory, UserFactory
+
+
+class Command(BaseCommand):
+    help = "Populates the database with dummy data"
+
+    def handle(self, *args: Any, **options: Any) -> None:
+        User = get_user_model()
+
+        # Set your custom superuser data
+        username: str = settings.ADMIN_USERNAME
+        email: str = settings.ADMIN_EMAIL
+        phone: str = settings.ADMIN_PHONE
+
+        password: str = settings.ADMIN_PASSWORD
+
+        try:
+            # Attempt to create a new superuser
+            User.objects.create_superuser(
+                username=username, phone=phone, email=email, password=password
+            )
+            self.stdout.write(
+                self.style.SUCCESS(f"Superuser {phone} created successfully")
+            )
+        except IntegrityError:
+            self.stdout.write(self.style.WARNING(f"Superuser {phone} already exists"))
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"An error occurred: {str(e)}"))
+
+        # # Create Users
+        # for _ in range(10):
+        #     UserFactory.create()
+
+        # # Create Organization Profiles
+        # for _ in range(5):
+        #     OrganizationProfileFactory.create()
+
+        # # ... create other objects
+
+        self.stdout.write(
+            self.style.SUCCESS("Successfully populated the database with dummy data")
+        )
+
+
+# docker-compose-prod.yml
+services:
+  web:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: ${DOCKER_IMAGE}
+    container_name: floorplan-app
+    restart: always
+    command: >
+      sh -c " 
+        # python manage.py makemigrations &&
+        # python manage.py migrate &&  
+        python manage.py populate_db &&
+        daphne floorplan_service.asgi:application -b 0.0.0.0 -p 8000
+      "
+    expose:
+      - "8000"
+    depends_on:
+      - redis
+    volumes:
+      - .:/code
+    env_file:
+      - .env
+    environment:
+      - VIRTUAL_HOST=floorplan.supersami.com
+      - LETSENCRYPT_HOST=floorplan.supersami.com
+      - LETSENCRYPT_EMAIL=rolfgroenewold@gmail.com
+
+  redis:
+    image: redis:latest
+    container_name: floorplan-app-redis
+
+  nginx-proxy:
+    image: jwilder/nginx-proxy
+    container_name: nginx_reverse_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./nginx/vhost.d:/etc/nginx/vhost.d
+      - ./nginx/html:/usr/share/nginx/html
+      # - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    environment:
+      - DEFAULT_HOST=floorplan.supersami.com
+
+  letsencrypt-nginx-proxy-companion:
+    image: jrcs/letsencrypt-nginx-proxy-companion
+    container_name: nginx_letsencrypt
+    depends_on:
+      - nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/etc/nginx/certs:rw
+      - ./nginx/vhost.d:/etc/nginx/vhost.d
+      - ./nginx/html:/usr/share/nginx/html
+      - ./nginx/acme.sh:/etc/acme.sh
+    environment:
+      - NGINX_PROXY_CONTAINER=nginx_reverse_proxy
+      - DEFAULT_EMAIL=rolfgroenewold@gmail.com
+
+  celery:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: ${DOCKER_IMAGE}
+    container_name: floorplan-app-celery
+    restart: always
+    command: >
+      sh -c "
+        echo 'Waiting for floorplan-app and redis...';
+        while ! nc -z floorplan-app 8000 || ! nc -z redis 6379; do
+          sleep 1;
+        done;
+        echo 'Web and Redis are up - starting celery worker';
+        celery -A floorplan_service worker --loglevel=info;
+      "
+    depends_on:
+      - redis
+      - web
+    env_file:
+      - .env
+    volumes:
+      - .:/code
+
+
+# Dockerfile
+# Pull the base image
+FROM python:3.9
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Install necessary system dependencies
+RUN apt-get update -y && \
+    apt-get install -y \
+    openjdk-17-jdk \
+    netcat-openbsd \
+    wget \
+    gnupg \
+    curl \
+    chromium \
+    chromium-driver
+
+# Install Node.js for Playwright
+RUN curl -fsSL https://deb.nodesource.com/setup_21.x | bash - && \
+    apt-get install -y nodejs
+
+# Clean up APT when done
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set work directory
+WORKDIR /code
+
+# Copy project
+COPY . /code/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Set execute permission for entrypoint.sh
+RUN chmod +x /code/entrypoint.sh
+
+ENTRYPOINT ["/code/entrypoint.sh"]
+
+# Run the application
+CMD ["daphne", "floorplan_service.asgi:application", "--port", "$PORT", "--bind", "0.0.0.0"]
 
 

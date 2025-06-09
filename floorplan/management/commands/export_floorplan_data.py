@@ -149,9 +149,7 @@ class Command(BaseCommand):
             "scale_metric",
             "scale_imperial",
             "calculated_sq_area_metric",
-            "calculated_floor_total_sq_area_metric",
             "calculated_area_imperial",
-            "calculated_floor_total_sq_area_imperial",
             "created_at",  # Changed header name
         ]
 
@@ -196,13 +194,7 @@ class Command(BaseCommand):
                         self._get_safe_value(row, "scale_metric"),
                         self._get_safe_value(row, "scale_imperial"),
                         self._get_safe_value(row, "calculated_sq_area_metric"),
-                        self._get_safe_value(
-                            row, "calculated_floor_total_sq_area_metric"
-                        ),
                         self._get_safe_value(row, "calculated_area_imperial"),
-                        self._get_safe_value(
-                            row, "calculated_floor_total_sq_area_imperial"
-                        ),
                         self._format_datetime(
                             analysis_time
                         ),  # Data source remains the same
