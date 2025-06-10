@@ -2,12 +2,19 @@
 
 import csv
 import io
+import logging
+import os
+import tempfile
+from io import BytesIO
+from urllib.parse import urlparse
 
+import boto3
 import requests
 from celery import shared_task
 from django.conf import settings
 from django.db import transaction
 from django.db.models import F  # Import F object for atomic updates
+from PIL import Image
 
 from floorplan.models import (
     AllFloorsCsvData,
@@ -92,11 +99,95 @@ def safe_string(value):
         return None
 
 
+def convert_gif_to_jpeg_and_upload_to_s3(url, user_id, property_id):
+    """
+    Downloads a GIF from the URL, converts it to JPEG, uploads to S3,
+    and returns the S3 URL of the uploaded JPEG.
+
+    Args:
+        url (str): The URL of the GIF image
+        user_id (str): User ID for S3 path construction
+        property_id (str): Property ID for S3 path construction
+
+    Returns:
+        str: S3 URL of the uploaded JPEG image or original URL if any error occurs
+    """
+    # Return original URL if not a GIF
+    parsed_url = urlparse(url)
+    base_name = os.path.basename(parsed_url.path)
+    if not base_name.lower().endswith(".gif"):
+        return url
+
+    logger.info(f"Converting GIF to JPEG for URL: {url}")
+    try:
+        # Download the GIF
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+
+        # Generate a new filename (replacing .gif with .jpg)
+        new_filename = os.path.splitext(base_name)[0] + ".jpg"
+
+        # Convert using PIL
+        with Image.open(BytesIO(response.content)) as img:
+            # Convert to RGB (removing transparency if present)
+            if img.mode in ("RGBA", "P"):
+                rgb_img = img.convert("RGB")
+            else:
+                rgb_img = img
+
+            # Save to a temporary buffer
+            temp_buffer = BytesIO()
+            rgb_img.save(temp_buffer, format="JPEG", quality=90)
+            temp_buffer.seek(0)
+
+            # Get S3 client using boto3
+            s3_client = boto3.client(
+                "s3",
+                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            )
+
+            # Construct S3 path
+            bucket_name = settings.AWS_STORAGE_BUCKET_NAME
+            s3_path = (
+                f"converted_images/user_{user_id}_property_{property_id}/{new_filename}"
+            )
+
+            # Upload to S3
+            s3_client.upload_fileobj(
+                temp_buffer,
+                bucket_name,
+                s3_path,
+                ExtraArgs={
+                    "ContentType": "image/jpeg",
+                    # ACL disabled since the bucket does not support ACLs
+                },
+            )
+
+            # Construct the new URL - use AWS_S3_CUSTOM_DOMAIN if available, otherwise fallback to default format
+            if hasattr(settings, "AWS_S3_CUSTOM_DOMAIN"):
+                s3_url = f"https://{settings.AWS_S3_CUSTOM_DOMAIN}/{s3_path}"
+            else:
+                # Default S3 URL format if custom domain not set
+                region = getattr(settings, "AWS_S3_REGION_NAME", "eu-north-1")
+                s3_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_path}"
+            logger.info(
+                f"Successfully converted GIF to JPEG and uploaded to S3: {s3_url}"
+            )
+            return s3_url
+
+    except Exception as e:
+        # Log the error but return the original URL to not block the flow
+        logger.error(f"Error converting GIF to JPEG: {str(e)}. Using original URL.")
+        return url
+
+
 @shared_task(bind=True)
 def process_floorplan_analysis(self, user_id, property_id, floorplans):
     """
     Task to initiate the analysis process via the analyzer API.
     Calculates hash IDs before the call and uses them as floorplan IDs in the payload.
+    Detects GIF images, converts them to JPEG, uploads to S3, and uses S3 URLs.
     """
     logger.info(
         "Starting floorplan analysis task for user_id=%s, property_id=%s",
@@ -155,13 +246,21 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
         original_url = original_url.strip()
 
         try:
+            # Check if it's a GIF and convert if needed
+            processed_url = convert_gif_to_jpeg_and_upload_to_s3(
+                original_url, str_user_id, str_property_id
+            )
+
+            # Generate hash ID using the original URL to maintain consistency
             stable_hash_id = FloorPlan.generate_hash_id(
                 property_id=str_property_id, user_id=str_user_id, url=original_url
             )
-            # Payload for API uses hash as the key
+
+            # Payload for API uses hash as the key and the processed URL
             hashed_floorplans_payload[stable_hash_id] = {
-                "url": original_url,
+                "url": processed_url,  # Use the processed URL (converted if it was a GIF)
                 "notes": fp_data.get("notes", ""),  # Include notes if provided
+                # "original_url": original_url,  # Keep track of the original URL
             }
             logger.info(
                 f"Generated hash '{stable_hash_id}' for URL '{original_url}' (Original key: '{original_key}')"
