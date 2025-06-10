@@ -140,15 +140,37 @@ def convert_gif_to_jpeg_and_upload_to_s3(url, user_id, property_id):
             rgb_img.save(temp_buffer, format="JPEG", quality=90)
             temp_buffer.seek(0)
 
+            # Get AWS credentials from settings or environment variables
+            aws_access_key_id = getattr(
+                settings, "AWS_ACCESS_KEY_ID", None
+            ) or os.environ.get("AWS_ACCESS_KEY_ID")
+            aws_secret_access_key = getattr(
+                settings, "AWS_SECRET_ACCESS_KEY", None
+            ) or os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+            if not aws_access_key_id or not aws_secret_access_key:
+                logger.error(
+                    "AWS credentials not found in settings or environment variables"
+                )
+                return url
+
             # Get S3 client using boto3
             s3_client = boto3.client(
                 "s3",
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
             )
 
-            # Construct S3 path
-            bucket_name = settings.AWS_STORAGE_BUCKET_NAME
+            # Get bucket name from settings or environment variables
+            bucket_name = getattr(
+                settings, "AWS_STORAGE_BUCKET_NAME", None
+            ) or os.environ.get("AWS_STORAGE_BUCKET_NAME")
+
+            if not bucket_name:
+                logger.error(
+                    "AWS bucket name not found in settings or environment variables"
+                )
+                return url
             s3_path = (
                 f"converted_images/user_{user_id}_property_{property_id}/{new_filename}"
             )
@@ -164,13 +186,29 @@ def convert_gif_to_jpeg_and_upload_to_s3(url, user_id, property_id):
                 },
             )
 
-            # Construct the new URL - use AWS_S3_CUSTOM_DOMAIN if available, otherwise fallback to default format
-            if hasattr(settings, "AWS_S3_CUSTOM_DOMAIN"):
-                s3_url = f"https://{settings.AWS_S3_CUSTOM_DOMAIN}/{s3_path}"
+            # Construct the new URL - try multiple approaches for maximum compatibility
+            # First check if AWS_S3_CUSTOM_DOMAIN is available in settings
+            custom_domain = getattr(
+                settings, "AWS_S3_CUSTOM_DOMAIN", None
+            ) or os.environ.get("AWS_S3_CUSTOM_DOMAIN")
+
+            if custom_domain:
+                s3_url = f"https://{custom_domain}/{s3_path}"
             else:
-                # Default S3 URL format if custom domain not set
-                region = getattr(settings, "AWS_S3_REGION_NAME", "eu-north-1")
+                # Try to get region from settings or environment
+                region = (
+                    getattr(settings, "AWS_S3_REGION_NAME", None)
+                    or os.environ.get("AWS_S3_REGION_NAME")
+                    or "us-east-1"  # Default to us-east-1 if region is not specified
+                )
+
+                # Standard S3 URL format
                 s3_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_path}"
+
+                # If region is us-east-1, there's an alternate format without region in URL that might work
+                if region == "us-east-1":
+                    # Try an alternate URL format as backup in case the first one doesn't work
+                    s3_url = f"https://{bucket_name}.s3.amazonaws.com/{s3_path}"
             logger.info(
                 f"Successfully converted GIF to JPEG and uploaded to S3: {s3_url}"
             )
@@ -251,9 +289,9 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
                 original_url, str_user_id, str_property_id
             )
 
-            # Generate hash ID using the original URL to maintain consistency
+            # Generate hash ID using the processed URL to maintain consistency
             stable_hash_id = FloorPlan.generate_hash_id(
-                property_id=str_property_id, user_id=str_user_id, url=original_url
+                property_id=str_property_id, user_id=str_user_id, url=processed_url
             )
 
             # Payload for API uses hash as the key and the processed URL
@@ -263,11 +301,11 @@ def process_floorplan_analysis(self, user_id, property_id, floorplans):
                 # "original_url": original_url,  # Keep track of the original URL
             }
             logger.info(
-                f"Generated hash '{stable_hash_id}' for URL '{original_url}' (Original key: '{original_key}')"
+                f"Generated hash '{stable_hash_id}' for URL '{processed_url}' (Original key: '{original_key}')"
             )
         except ValueError as e:
             logger.error(
-                f"Failed to generate hash for URL '{original_url}' (Original key: '{original_key}'): {e}. Skipping this floorplan."
+                f"Failed to generate hash for URL '{processed_url}' (Original key: '{original_key}'): {e}. Skipping this floorplan."
             )
             skipped_floorplans.append(original_key)
         except Exception as e:
